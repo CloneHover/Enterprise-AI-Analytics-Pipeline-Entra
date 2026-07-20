@@ -165,37 +165,53 @@ def detect_graph_audit_api_version(http_client: Any) -> str:
     """
     Auto-detect the Graph API version that supports /security/auditLog.
 
-    PS equivalent: Get-GraphAuditApiUri auto-detection block (L7884–7898)
+    PS equivalent: Get-GraphAuditApiUri auto-detection block (L13560–L13575).
 
-    Tries v1.0 first, falls back to beta if the endpoint returns an error.
-    Result is cached for the session.
+    Uses a POST-probe (not GET) against /security/auditLog/queries with an empty
+    body. Rationale: on tenants where the v1.0 write endpoint has not yet been
+    rolled out, GET v1.0/queries can still return 200 (empty list) while POST
+    v1.0/queries returns 404. The pipeline uses POST to submit queries, so we
+    must probe with the same verb.
+
+    Probe interpretation:
+      - 2xx / 400 / 401 / 403 → endpoint exists on this version (validation or
+        auth error is fine — the route is live).
+      - 404 / 405            → endpoint does NOT exist on this version; try next.
+      - 5xx / exception      → transient failure; try next.
+
+    Tries v1.0 first, falls back to beta. Result is cached for the session.
     """
     global _detected_api_version
     if _detected_api_version is not None:
         return _detected_api_version
 
     for version in ('v1.0', 'beta'):
+        test_uri = f"https://graph.microsoft.com/{version}/security/auditLog/queries"
         try:
-            test_uri = f"https://graph.microsoft.com/{version}/security/auditLog/queries"
-            resp = http_client.get(test_uri)
-            # A 200 or even 403 means the segment exists; only 400 "Resource not found" means it doesn't
-            if resp.status_code != 400:
+            resp = http_client.post(test_uri, json={})
+            sc = resp.status_code
+            if sc not in (404, 405) and sc < 500:
                 _detected_api_version = version
-                logger.info("Graph API: security/auditLog endpoint using version %s", version)
+                if version == 'v1.0':
+                    logger.info(
+                        "Graph API: security/auditLog endpoint using version %s",
+                        version,
+                    )
+                else:
+                    logger.warning(
+                        "Graph API: security/auditLog endpoint using version %s (fallback from v1.0)",
+                        version,
+                    )
                 return version
-            # Check if the error is specifically about the segment not being found
-            try:
-                err_body = resp.json()
-                err_msg = err_body.get('error', {}).get('message', '')
-                if 'Resource not found' in err_msg:
-                    logger.info("Graph API: %s returned 'Resource not found', trying next version", version)
-                    continue
-            except Exception:
-                pass
-            # Non-segment-not-found 400 — treat as available
-            _detected_api_version = version
-            return version
-        except Exception:
+            logger.info(
+                "Graph API: %s POST-probe returned HTTP %d, trying next version",
+                version, sc,
+            )
+        except Exception as e:
+            logger.info(
+                "Graph API: %s POST-probe raised %s, trying next version",
+                version, type(e).__name__,
+            )
             continue
 
     # Default fallback

@@ -113,25 +113,44 @@ def get_graph_audit_api_uri(path: str, *, http_client=None) -> str:
 
     if _graph_audit_api_version is None:
         if http_client is not None:
-            # Auto-detect: try current version first
-            test_uri = f"{_GRAPH_BASE_URL}/{_GRAPH_API_VERSION_CURRENT}/security/auditLog/queries"
-            try:
-                resp = http_client.get(test_uri)
-                if resp.status_code < 400 or resp.status_code == 403:
-                    # 403 means endpoint exists but permission denied — still valid version
-                    _graph_audit_api_version = _GRAPH_API_VERSION_CURRENT
-                    logger.info(
-                        "Graph API: security/auditLog endpoint using version %s",
-                        _GRAPH_API_VERSION_CURRENT,
-                    )
-                else:
-                    raise Exception(f"HTTP {resp.status_code}")
-            except Exception:
+            # POST-probe both versions (mirrors PS Get-GraphAuditApiUri L13560-L13575).
+            # We POST an empty body against /security/auditLog/queries:
+            #   - endpoint EXISTS → Graph returns 400 (validation error), 401/403 (auth),
+            #     or 2xx (accepted). All are treated as "this version is available".
+            #   - endpoint DOES NOT EXIST → Graph returns 404 (not found) or
+            #     405 (method not allowed). Both trigger fallback to the next version.
+            # A GET-probe is NOT reliable here: on some tenants GET v1.0/queries
+            # returns 200 (empty list) even when POST v1.0/queries returns 404
+            # because the write endpoint has not yet been rolled out.
+            for version in (_GRAPH_API_VERSION_CURRENT, _GRAPH_API_VERSION_PREVIOUS):
+                test_uri = f"{_GRAPH_BASE_URL}/{version}/security/auditLog/queries"
+                try:
+                    resp = http_client.post(test_uri, json={})
+                    sc = resp.status_code
+                    # 404/405 → endpoint not available on this version; try next.
+                    # 5xx → server error; try next.
+                    if sc not in (404, 405) and sc < 500:
+                        _graph_audit_api_version = version
+                        if version == _GRAPH_API_VERSION_CURRENT:
+                            logger.info(
+                                "Graph API: security/auditLog endpoint using version %s",
+                                version,
+                            )
+                        else:
+                            logger.warning(
+                                "Graph API: security/auditLog endpoint using version %s (fallback from %s)",
+                                version,
+                                _GRAPH_API_VERSION_CURRENT,
+                            )
+                        break
+                except Exception:
+                    continue
+            if _graph_audit_api_version is None:
+                # Both probes failed (network error etc.) — default to previous (beta).
                 _graph_audit_api_version = _GRAPH_API_VERSION_PREVIOUS
                 logger.warning(
-                    "Graph API: security/auditLog endpoint using version %s (fallback from %s)",
+                    "Graph API: Could not probe either version, defaulting to %s",
                     _GRAPH_API_VERSION_PREVIOUS,
-                    _GRAPH_API_VERSION_CURRENT,
                 )
         else:
             # No http_client — default to current version

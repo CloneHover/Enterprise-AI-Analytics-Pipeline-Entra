@@ -1,0 +1,16 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/variables/1.0.0/schema.json",
+  "variables": [
+    { "name": "TenantId",       "type": "String",  "value": "" },
+    { "name": "ClientId",       "type": "String",  "value": "" },
+    { "name": "KeyVaultUri",    "type": "String",  "value": "" },
+    { "name": "KeyVaultSecret", "type": "String",  "value": "" },
+    { "name": "GitHubRepoUrl",  "type": "String",  "value": "" },
+    { "name": "GitHubRef",      "type": "String",  "value": "main" },
+    { "name": "TargetSchema",   "type": "String",  "value": "dbo" },
+    { "name": "KeepScratch",    "type": "Boolean", "value": false },
+    { "name": "MaxConcurrency", "type": "Integer", "value": 10 },
+    { "name": "PartitionHours", "type": "Integer", "value": 12 },
+    { "name": "RetentionDays",  "type": "Integer", "value": 90 }
+  ]
+}

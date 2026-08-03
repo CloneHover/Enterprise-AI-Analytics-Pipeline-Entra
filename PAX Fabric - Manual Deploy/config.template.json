@@ -1,0 +1,34 @@
+{
+  "_comment": "Copy this file to config.json, fill in your values, then run Deploy-PaxFabric.ps1 -ConfigPath .\\config.json",
+
+  "TenantId":    "<your-entra-tenant-guid>",
+  "WorkspaceId": "<your-fabric-workspace-guid>",
+
+  "LakehouseName": "<your-lakehouse-display-name>",
+  "VarLibName":    "<your-variable-library-display-name>",
+  "NotebookName":  "<your-notebook-display-name>",
+  "PipelineName":  "<your-data-pipeline-display-name>",
+
+  "AppRegistration": {
+    "TenantId": "<your-entra-tenant-guid>",
+    "ClientId": "<app-registration-client-id-with-graph-permissions>"
+  },
+
+  "KeyVault": {
+    "KeyVaultUri":    "https://<your-kv>.vault.azure.net/",
+    "KeyVaultSecret": "<secret-name>"
+  },
+
+  "GitHub": {
+    "GitHubRepoUrl": "https://github.com/microsoft/Enterprise-AI-Analytics-Pipeline.git",
+    "GitHubRef":     "main"
+  },
+
+  "Defaults": {
+    "TargetSchema":   "dbo",
+    "KeepScratch":    false,
+    "MaxConcurrency": 10,
+    "PartitionHours": 12,
+    "RetentionDays":  90
+  }
+}

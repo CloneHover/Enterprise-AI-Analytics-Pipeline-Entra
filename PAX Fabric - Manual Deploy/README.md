@@ -87,7 +87,7 @@ The notebook `pip install`s the pipeline code from your repo at runtime. You nee
 ## 2. The deployment package
 
 ```text
-deploy/
+PAX Fabric - Manual Deploy/
 ├── Deploy-PaxFabric.ps1          # Main deployment script (idempotent)
 ├── config.template.json          # Copy → config.json → edit
 ├── README.md                     # This file
@@ -106,7 +106,7 @@ deploy/
 ### Step 1 — Fill in the config
 
 ```powershell
-cd deploy
+cd "PAX Fabric - Manual Deploy"
 Copy-Item config.template.json config.json
 notepad config.json      # or your favourite editor
 ```
@@ -129,7 +129,7 @@ Populate every `<...>` placeholder. Minimum required:
 ### Step 2 — Run the deployment
 
 ```powershell
-cd deploy
+cd "PAX Fabric - Manual Deploy"
 .\Deploy-PaxFabric.ps1 -ConfigPath .\config.json
 ```
 

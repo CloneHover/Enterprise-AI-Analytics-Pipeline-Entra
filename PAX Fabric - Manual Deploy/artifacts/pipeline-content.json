@@ -18,6 +18,7 @@
           "parameters": {
             "StartDate":        { "value": "@pipeline().parameters.StartDate",        "type": "string" },
             "EndDate":          { "value": "@pipeline().parameters.EndDate",          "type": "string" },
+            "NumberOfDays":     { "value": "@pipeline().parameters.NumberOfDays",     "type": "int"    },
             "Rollup":           { "value": "@pipeline().parameters.Rollup",           "type": "bool"   },
             "IncludeM365Usage": { "value": "@pipeline().parameters.IncludeM365Usage", "type": "bool"   },
             "IncludeUserInfo":  { "value": "@pipeline().parameters.IncludeUserInfo",  "type": "bool"   },
@@ -29,6 +30,7 @@
     "parameters": {
       "StartDate":        { "type": "string", "defaultValue": "" },
       "EndDate":          { "type": "string", "defaultValue": "" },
+      "NumberOfDays":     { "type": "int",    "defaultValue": 0     },
       "Rollup":           { "type": "bool",   "defaultValue": true  },
       "IncludeM365Usage": { "type": "bool",   "defaultValue": true  },
       "IncludeUserInfo":  { "type": "bool",   "defaultValue": true  },

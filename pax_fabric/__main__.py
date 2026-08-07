@@ -1592,6 +1592,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     operations=operations_list,
                     record_types=config.record_types,
                     service_types=config.service_types,
+                    user_principal_names=list(user_ids) if user_ids else None,
                     http_client=http,
                     api_version=api_version,
                     partition_index=p_idx,

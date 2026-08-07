@@ -490,3 +490,143 @@ def get_entra_users_data(
         )
 
     return entra_users
+
+
+# ---------------------------------------------------------------------------
+# UserInfoFile / UserInfoSupplement (v1.11.15 parity)
+# ---------------------------------------------------------------------------
+# PS equivalents: Resolve-DirectoryCsvInput, Merge-PaxEntraSupplement.
+#
+# -UserInfoFile REPLACES the live Entra /users pull with a customer-provided
+# CSV (rows passed through as-supplied; only a UserPrincipalName-like column
+# is required).
+# -UserInfoSupplement fetches the live directory normally, then left-joins a
+# supplemental CSV's columns onto matching Entra rows by UserPrincipalName
+# (join key itself is never copied into the output; every Entra row is kept;
+# unmatched supplemental rows are reported back to the caller for logging).
+#
+# NOTE (scope): only LOCAL filesystem paths are supported for the CSV input
+# in this port. SharePoint/OneLake remote inputs raise a clear
+# NotImplementedError — the PS remote-staging equivalent (Get-RemoteFile-*)
+# has no Fabric download-side counterpart yet (mod14_pax_remote_output.py
+# only implements the upload path).
+
+_UPN_COLUMN_VARIANTS = {"userprincipalname", "upn", "personid"}
+
+
+def _detect_upn_column(fieldnames: list[str]) -> Optional[str]:
+    """Return the actual column name (preserving original casing) that
+    matches a known UserPrincipalName variant, or ``None`` if none found."""
+    for name in fieldnames:
+        if name.strip().lower() in _UPN_COLUMN_VARIANTS:
+            return name
+    return None
+
+
+def _read_directory_csv(path: str) -> list[dict[str, Any]]:
+    """Read a local CSV file into a list of dicts. Raises ``FileNotFoundError``
+    for a missing local path and ``NotImplementedError`` for a remote
+    (SharePoint/OneLake) URL, which is out of scope for this port."""
+    import csv as _csv
+
+    if path.startswith("https://") or path.startswith("http://"):
+        raise NotImplementedError(
+            f"Remote UserInfoFile/UserInfoSupplement inputs are not yet supported "
+            f"in pax_fabric (got: {path!r}). Download the CSV locally first, or "
+            f"stage it under the lakehouse Files/ path and pass that local path."
+        )
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = _csv.DictReader(f)
+        return [dict(row) for row in reader]
+
+
+def load_user_info_file(path: str) -> list[dict[str, Any]]:
+    """Load the Entra user directory REPLACEMENT CSV for ``-UserInfoFile``.
+
+    Requires a UserPrincipalName-like column (``UserPrincipalName``, ``UPN``,
+    or ``PersonId``, case-insensitive); the detected column is renamed to
+    ``userPrincipalName`` so downstream code (dedup, license lookups,
+    deidentify) matches the live-fetch shape. Every other column is passed
+    through verbatim. Raises ``ValueError`` if no UPN-like column is found.
+    """
+    rows = _read_directory_csv(path)
+    if not rows:
+        return []
+
+    upn_col = _detect_upn_column(list(rows[0].keys()))
+    if upn_col is None:
+        raise ValueError(
+            f"UserInfoFile {path!r} has no UserPrincipalName-like column "
+            f"(expected one of: UserPrincipalName, UPN, PersonId)."
+        )
+
+    if upn_col != "userPrincipalName":
+        for row in rows:
+            row["userPrincipalName"] = row.pop(upn_col, None)
+    return rows
+
+
+def load_user_info_supplement(path: str) -> tuple[list[dict[str, Any]], str]:
+    """Load the hybrid-enrichment supplemental CSV for ``-UserInfoSupplement``.
+
+    Requires EXACTLY ONE UserPrincipalName-like column (used purely as the
+    join key). Returns ``(rows, upn_column_name)``. Raises ``ValueError`` if
+    zero or more than one UPN-like column is present.
+    """
+    rows = _read_directory_csv(path)
+    if not rows:
+        return [], ""
+
+    fieldnames = list(rows[0].keys())
+    matches = [name for name in fieldnames if name.strip().lower() in _UPN_COLUMN_VARIANTS]
+    if len(matches) == 0:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has no UserPrincipalName-like column "
+            f"(expected exactly one of: UserPrincipalName, UPN, PersonId)."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"UserInfoSupplement {path!r} has multiple UserPrincipalName-like "
+            f"columns ({matches}); exactly one join key column is required."
+        )
+    return rows, matches[0]
+
+
+def merge_entra_supplement(
+    entra_rows: list[dict[str, Any]],
+    supplement_rows: list[dict[str, Any]],
+    supplement_upn_column: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Entra-LEFT join: append every supplemental column (except the join key
+    itself) onto each Entra row whose ``userPrincipalName`` matches
+    (case-insensitive). Every Entra row is preserved even with no match
+    (supplemental columns become absent/blank for that row). Returns
+    ``(merged_rows, unmatched_supplement_rows)`` — the latter for caller-side
+    reporting/logging, mirroring PS's "unmatched rows are reported and excluded".
+    """
+    supplement_by_upn: dict[str, dict[str, Any]] = {}
+    matched_upns: set[str] = set()
+    for srow in supplement_rows:
+        key = str(srow.get(supplement_upn_column, "")).strip().lower()
+        if key:
+            supplement_by_upn[key] = srow
+
+    merged: list[dict[str, Any]] = []
+    for erow in entra_rows:
+        upn_key = str(erow.get("userPrincipalName", "")).strip().lower()
+        srow = supplement_by_upn.get(upn_key)
+        out = dict(erow)
+        if srow is not None:
+            matched_upns.add(upn_key)
+            for col, val in srow.items():
+                if col == supplement_upn_column:
+                    continue  # join key is never copied into output
+                out[col] = val
+        merged.append(out)
+
+    unmatched = [
+        srow
+        for srow in supplement_rows
+        if str(srow.get(supplement_upn_column, "")).strip().lower() not in matched_upns
+    ]
+    return merged, unmatched

@@ -603,10 +603,22 @@ def run(params: Optional[dict] = None) -> dict:
                     config.record_types = list(cp_params["recordTypes"])
                 if cp_params.get("serviceTypes"):
                     config.service_types = list(cp_params["serviceTypes"])
-                if cp_params.get("userIds"):
+                # UserIds / GroupNames: v1.11.15 parity — "-UserIds / -GroupNames
+                # Override the checkpoint's user/group scope (fail-closed)". If the
+                # caller explicitly supplied either on THIS resume invocation, that
+                # value wins; only fall back to the checkpoint's stored scope when
+                # the caller did not supply one for this run.
+                _lc_params = {str(k).lower().replace("-", "_"): v for k, v in (params or {}).items()}
+                _user_ids_overridden = _lc_params.get("userids") is not None or _lc_params.get("user_ids") is not None
+                _group_names_overridden = _lc_params.get("groupnames") is not None or _lc_params.get("group_names") is not None
+                if cp_params.get("userIds") and not _user_ids_overridden:
                     config.user_ids = list(cp_params["userIds"])
-                if cp_params.get("groupNames"):
+                if cp_params.get("groupNames") and not _group_names_overridden:
                     config.group_names = list(cp_params["groupNames"])
+                if _user_ids_overridden:
+                    write_log(f"  [RESUME] -UserIds override applied (checkpoint scope replaced): {config.user_ids}")
+                if _group_names_overridden:
+                    write_log(f"  [RESUME] -GroupNames override applied (checkpoint scope replaced): {config.group_names}")
 
                 # Restore agent filtering (PS L20744-20748)
                 if cp_params.get("agentId"):
@@ -752,6 +764,11 @@ def run(params: Optional[dict] = None) -> dict:
             enable_explosion = getattr(config, "explode_arrays", False)
             enable_deep = getattr(config, "explode_deep", False)
             prompt_filter_value = getattr(config, "prompt_filter", None)
+            deidentifier = None
+            if getattr(config, "deidentify", False):
+                from .mod18_pax_deidentify import PaxDeidentifier
+                deidentifier = PaxDeidentifier()
+                write_log("Deidentify: enabled (deterministic one-way CSV transformation)")
 
             out_filename = _build_output_filename(config)
             output_path = str(Path(csv_root) / out_filename)
@@ -845,6 +862,8 @@ def run(params: Optional[dict] = None) -> dict:
                     continue
 
                 for r in rows:
+                    if deidentifier is not None:
+                        r = deidentifier.deidentify_purview_record(r)
                     pending_rows.append(r)
                     if len(pending_rows) >= _SPILL_BATCH_SIZE:
                         _flush_pending()
@@ -879,8 +898,26 @@ def run(params: Optional[dict] = None) -> dict:
                 )
 
         # --------------------------------------------------------------
-        # 6. Post-processing: Entra users + rollup.
+        # 6. Post-processing: Agent 365, Entra users + rollup.
         # --------------------------------------------------------------
+        # This was already available in the package but was omitted from the
+        # Fabric orchestration path.  v1.11.15 exposes it as a first-class
+        # catalog output, including the audit-free OnlyAgent365Info mode.
+        if getattr(config, "include_agent365_info", False) or only_agent365:
+            set_progress_phase("Export", status="Agent 365 catalog")
+            from .mod12_pax_agent365 import Agent365State, invoke_agent365_phase
+            invoke_agent365_phase(
+                state=Agent365State(),
+                include_agent365_info=getattr(config, "include_agent365_info", False),
+                only_agent365_info=only_agent365,
+                auth_mode=config.auth,
+                output_path=(getattr(config, "output_path_agent365_info", None) or config.output_path),
+                run_timestamp=config.script_run_timestamp,
+                graph_connected=is_connected(),
+                start_date=config.trim_start_date_utc,
+                end_date=config.trim_end_date_utc,
+            )
+
         if only_user_info:
             set_progress_phase("Export")
             _export_entra_users_only(ctx)

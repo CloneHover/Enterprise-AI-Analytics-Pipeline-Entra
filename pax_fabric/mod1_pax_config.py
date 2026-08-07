@@ -32,7 +32,7 @@ from typing import Optional
 # SCRIPT METADATA
 # ===========================================================================
 
-SCRIPT_VERSION = "1.11.3"
+SCRIPT_VERSION = "1.11.15"
 
 
 # ===========================================================================
@@ -168,6 +168,10 @@ class PAXConfig:
     output_path: Optional[str] = None
     output_path_user_info: Optional[str] = None       # Per-data-type: EntraUsers CSV
     output_path_agent365_info: Optional[str] = None   # Per-data-type: Agent 365 catalog
+    # AISID destinations are accepted for notebook-parameter compatibility.
+    # The upstream v1.11.15 script deliberately gates AISID; validation below
+    # preserves that behaviour instead of silently producing partial output.
+    output_path_defender_usage: Optional[str] = None
     output_path_log: Optional[str] = None              # Per-data-type: log file
     flat_depth: int = 120
 
@@ -265,6 +269,7 @@ class PAXConfig:
     append_file: Optional[str] = None
     append_user_info: Optional[str] = None
     append_agent365_info: Optional[str] = None
+    append_defender_usage: Optional[str] = None
     combine_output: bool = False
     force: bool = False
     skip_diagnostics: bool = False
@@ -279,6 +284,21 @@ class PAXConfig:
     emit_metrics_json: bool = False
     metrics_path: Optional[str] = None
     auto_completeness: bool = False
+    # v1.11.15 additions
+    dashboard: str = "AIO"
+    deidentify: bool = False 
+    filler_label: Optional[str] = None
+    filler_label_text: Optional[str] = None
+    user_info_file: Optional[str] = None
+    # Path to a supplemental CSV that is left-joined onto the live Entra
+    # directory by UserPrincipalName (hybrid enrichment). A string path, NOT
+    # a bare switch — mirrors PS `[string]$UserInfoSupplement`.
+    user_info_supplement: Optional[str] = None
+    verify_partition_stability: bool = False
+    disable_aisid_delta_cache: bool = False
+    clear_uncertain_create: Optional[list[int]] = None
+    clear_uncertain_contract: Optional[list[str]] = None
+    skip_version_check: bool = False
 
     # --- Resume ---
     resume: Optional[str] = None  # None=not resuming, ''=auto-discover, 'path'=explicit
@@ -416,13 +436,20 @@ def resolve_activity_types(config: PAXConfig) -> list[str]:
 _SP_URL_PATTERN = re.compile(
     r'^https?://[^/]+\.sharepoint(?:-df|-mil)?\.[a-z]{2,3}(?:/.+)?$'
 )
+# Fabric item segment: EITHER the name form (<name>.Lakehouse, suffix required)
+# OR the GUID form (<itemGUID>, no suffix) - both are first-class OneLake DFS
+# addressing modes (learn.microsoft.com/fabric/onelake/onelake-access-api).
+_FABRIC_ITEM_SEG = (
+    r'(?:[^/]+\.Lakehouse|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+)
 _FABRIC_ROOT_PATTERN = re.compile(
     r'^https://([a-z0-9-]+-)?onelake\.dfs\.fabric\.microsoft\.com/'
-    r'[^/]+/[^/]+\.Lakehouse(/Tables(/[A-Za-z_][A-Za-z0-9_]*)?|/Files(/.+)?)?/?$'
+    r'[^/]+/' + _FABRIC_ITEM_SEG + r'(/Tables(/[A-Za-z_][A-Za-z0-9_]*)?|/Files(/.+)?)?/?$'
 )
 _FABRIC_FILES_PATTERN = re.compile(
     r'^https://([a-z0-9-]+-)?onelake\.dfs\.fabric\.microsoft\.com/'
-    r'[^/]+/[^/]+\.Lakehouse/Files(/.+)?/?$'
+    r'[^/]+/' + _FABRIC_ITEM_SEG + r'/Files(/.+)?/?$'
 )
 
 
@@ -624,6 +651,58 @@ def validate_config(config: PAXConfig) -> list[str]:
     """
     errors: list[str] = []
 
+    # v1.11.15 intentionally ships AISID as a gated preview. Keep Fabric in
+    # lockstep with the source script: fail early rather than claim success
+    # while omitting Defender/AISID datasets.
+    if str(getattr(config, "dashboard", "AIO")).upper() == "AISID":
+        errors.append(
+            "Dashboard=AISID is temporarily gated in PAX v1.11.15 and is not "
+            "available for customer use."
+        )
+    if getattr(config, "output_path_defender_usage", None) or getattr(config, "append_defender_usage", None):
+        errors.append("OutputPathDefenderUsage and AppendDefenderUsage require Dashboard=AISID, which is temporarily gated.")
+
+    if getattr(config, "deidentify", False) and config.export_workbook:
+        errors.append("Deidentify cannot be combined with ExportWorkbook; use CSV output to avoid identifiable Excel data.")
+
+    filler = getattr(config, "filler_label", None)
+    filler_text = getattr(config, "filler_label_text", None)
+    if filler:
+        if str(filler).lower() not in {"blank", "fixed"}:
+            errors.append("FillerLabel must be either 'Blank' or 'Fixed'.")
+        if str(filler).lower() == "fixed" and not str(filler_text or "").strip():
+            errors.append("FillerLabelText is required when FillerLabel is 'Fixed'.")
+    elif filler_text:
+        errors.append("FillerLabelText can only be used with FillerLabel='Fixed'.")
+
+    # --- UserInfoFile / UserInfoSupplement (v1.11.15 parity) -----------------
+    # UserInfoFile REPLACES the live Entra directory pull; mutually exclusive
+    # with GroupNames (which requires the live directory to expand against)
+    # and with UserInfoSupplement (the hybrid mode). PS guard: PAX4A-GUARD.
+    if config.user_info_file and config.group_names:
+        errors.append(
+            "UserInfoFile and GroupNames are mutually exclusive. UserInfoFile "
+            "replaces the live Entra directory pull that GroupNames expansion depends on."
+        )
+    if config.user_info_file and config.user_info_supplement:
+        errors.append(
+            "UserInfoFile and UserInfoSupplement are mutually exclusive. "
+            "UserInfoFile replaces the live directory; UserInfoSupplement enriches it."
+        )
+    # UserInfoSupplement requires the live /users pull, so it is incompatible
+    # with -UseEOM (no Graph directory) and -RAWInputCSV (offline replay).
+    if config.user_info_supplement:
+        supplement_conflicts: list[str] = []
+        if config.use_eom:
+            supplement_conflicts.append("UseEOM")
+        if config.raw_input_csv:
+            supplement_conflicts.append("RAWInputCSV")
+        if supplement_conflicts:
+            errors.append(
+                f"UserInfoSupplement is incompatible with: {', '.join(supplement_conflicts)}. "
+                f"UserInfoSupplement requires a live Entra /users directory pull."
+            )
+
     # MaxConcurrency range (1-10)
     if not (1 <= config.max_concurrency <= 10):
         errors.append(
@@ -650,16 +729,6 @@ def validate_config(config: PAXConfig) -> list[str]:
     # IncludeAgent365Info / OnlyAgent365Info mutual exclusion
     if config.include_agent365_info and config.only_agent365_info:
         errors.append("IncludeAgent365Info and OnlyAgent365Info are mutually exclusive.")
-
-    # OnlyAgent365Info is unsupported under app-only auth.
-    # The Agent Package Management API requires delegated permissions (signed-in user),
-    # but the pipeline now only supports AppRegistration + client_secret (app-only).
-    if config.only_agent365_info:
-        errors.append(
-            "OnlyAgent365Info is not supported. The Agent Package Management API "
-            "requires delegated permissions, but only app-only AppRegistration auth "
-            "is supported. Use IncludeAgent365Info on an interactive host instead."
-        )
 
     # IncludeAgent365Info/OnlyAgent365Info incompatible with replay and EOM modes.
     # PS L2659-2680: both switches blocked with RAWInputCSV/UseEOM;
@@ -894,6 +963,13 @@ def validate_config(config: PAXConfig) -> list[str]:
         config.include_user_info = True
     if config.append_agent365_info and not config.include_agent365_info:
         config.include_agent365_info = True
+    # UserInfoFile / UserInfoSupplement each auto-enable IncludeUserInfo
+    # (PAX4D-AUTOENABLE / PAX-UIS-GUARD parity) so a caller need only pass
+    # the file/supplement path.
+    if config.user_info_file and not config.include_user_info:
+        config.include_user_info = True
+    if config.user_info_supplement and not config.include_user_info:
+        config.include_user_info = True
 
     # =========================================================================
     # DESTINATION PAIR XOR VALIDATION (v1.11.2)
@@ -1460,6 +1536,10 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("onlyuserinfo", "only_user_info"),
         ("includeagent365info", "include_agent365_info"),
         ("onlyagent365info", "only_agent365_info"),
+        ("deidentify", "deidentify"),
+        ("verifypartitionstability", "verify_partition_stability"),
+        ("disableaisiddeltacache", "disable_aisid_delta_cache"),
+        ("skipversioncheck", "skip_version_check"),
         ("includetelemetry", "include_telemetry"),
         ("explodearrays", "explode_arrays"),
         ("explodedeep", "explode_deep"),
@@ -1519,13 +1599,100 @@ def config_from_params(params: dict) -> "PAXConfig":
         ("metricspath", "metrics_path"),
         ("rawinputcsv", "raw_input_csv"),
         ("resume", "resume"),
+        ("dashboard", "dashboard"),
+        ("fillerlabel", "filler_label"),
+        ("fillerlabeltext", "filler_label_text"),
+        ("userinfofile", "user_info_file"),
+        ("userinfosupplement", "user_info_supplement"),
+        ("outputpathdefenderusage", "output_path_defender_usage"),
+        ("appenddefenderusage", "append_defender_usage"),
     ):
         v = pick(src, dst)
         if v is not None:
             setattr(cfg, dst, str(v))
 
+    for src, dst, caster in (
+        ("clearuncertaincreate", "clear_uncertain_create", int),
+        ("clearuncertaincontract", "clear_uncertain_contract", str),
+    ):
+        v = pick(src, dst)
+        if v is not None:
+            values = _coerce_csv_list(v)
+            if values is not None:
+                try:
+                    setattr(cfg, dst, [caster(item) for item in values])
+                except (TypeError, ValueError):
+                    pass
+
     cfg.__post_init__()
     return cfg
+
+
+# ===========================================================================
+# STARTUP VERSION CHECK (v1.11.15 parity: PS Invoke-PaxVersionCheck)
+# ===========================================================================
+# Informational, non-blocking, failure-isolated check against the public PAX
+# repo's release manifest. Never raises, never prompts; capped at ~5s if the
+# server is unreachable. Skippable via config.skip_version_check /
+# -SkipVersionCheck (offline / locked-down environments).
+
+_PAX_REPO_URL = "https://github.com/microsoft/PAX"
+_PAX_VERSIONS_URL = "https://raw.githubusercontent.com/microsoft/PAX/release/versions.json"
+
+
+def _parse_version_tuple(value: str) -> tuple[int, ...]:
+    """Best-effort dotted-numeric version parse (avoids a hard dependency on
+    ``packaging``). Non-numeric segments are dropped; an unparsable string
+    yields an empty tuple so comparisons safely evaluate as "not newer"."""
+    parts: list[int] = []
+    for segment in str(value).strip().split("."):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def check_for_updates(current_version: str = SCRIPT_VERSION, *, log=None) -> None:
+    """Check the public PAX repo for a newer release and emit a single
+    informational line. Mirrors PS ``Invoke-PaxVersionCheck``: reads
+    ``versions.json`` from the release branch, compares
+    ``products.purview.version`` against ``current_version``, and never
+    throws or blocks the run on failure.
+
+    ``log`` is an optional callable ``(message: str) -> None``; defaults to
+    :func:`pax_fabric.mod3_pax_logging.write_log_host` when available, else
+    falls back to ``print``.
+    """
+    if log is None:
+        try:
+            from .mod3_pax_logging import write_log_host as log  # type: ignore[assignment]
+        except Exception:
+            log = print
+
+    try:
+        import json
+        import urllib.request
+
+        req = urllib.request.Request(
+            _PAX_VERSIONS_URL, headers={"User-Agent": "pax-fabric-version-check"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 (fixed, known public repo)
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+        latest = str(((payload.get("products") or {}).get("purview") or {}).get("version") or "")
+        rel_date = str(payload.get("lastUpdated") or "")
+
+        if latest and _parse_version_tuple(latest) > _parse_version_tuple(current_version):
+            line = f"  Update available: PAX v{latest}"
+            if rel_date:
+                line += f" (released {rel_date})"
+            line += f" - you are on v{current_version}. Latest: {_PAX_REPO_URL}"
+            log(line)
+        else:
+            log(f"  Version check: you are on the latest PAX version (v{current_version}). {_PAX_REPO_URL}")
+    except Exception:
+        log(f"  Version check skipped: the PAX GitHub repo was not reachable (offline or blocked). Latest: {_PAX_REPO_URL}")
 
 
 # ===========================================================================

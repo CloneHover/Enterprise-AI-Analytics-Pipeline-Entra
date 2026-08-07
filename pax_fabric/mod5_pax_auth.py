@@ -186,7 +186,8 @@ def connect_purview_audit(
         scopes: List of Graph API scopes to request.
         http_client: Optional HTTP client for API version detection.
         remote_output_mode: 'None' | 'SharePoint' | 'Fabric'. When 'SharePoint',
-                            injects Sites.ReadWrite.All + Files.ReadWrite.All scopes.
+                            injects the Sites.ReadWrite.All scope (sufficient for
+                            every SharePoint drive/file endpoint used; v1.11.15 parity).
         include_agent365: If True, defers auth context display until Phase 2
                           Agent365 sign-in completes.
 
@@ -218,12 +219,13 @@ def connect_purview_audit(
     if scopes is None:
         scopes = ["https://graph.microsoft.com/.default"]
 
-    # SharePoint remote-output: inject drive write scopes (PS L8398)
+    # SharePoint remote-output: inject drive write scope (PS L8398, v1.11.15).
+    # Sites.ReadWrite.All alone authorizes every SharePoint drive/file endpoint
+    # used here (resolve site/drive, create folder, upload, download) for both
+    # delegated and application auth, so Files.ReadWrite.All is not requested.
     if remote_output_mode == "SharePoint":
         if "Sites.ReadWrite.All" not in scopes:
             scopes = list(scopes) + ["Sites.ReadWrite.All"]
-        if "Files.ReadWrite.All" not in scopes:
-            scopes = list(scopes) + ["Files.ReadWrite.All"]
 
     logger.info("Connecting to Microsoft Graph Security API (method: AppRegistration)...")
 

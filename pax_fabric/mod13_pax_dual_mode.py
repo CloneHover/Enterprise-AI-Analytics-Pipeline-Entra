@@ -79,7 +79,7 @@ def expand_group_to_users(
         Graph API request function. Used for:
           - GET /groups?$filter=displayName eq '...' → resolve name to ID
           - GET /groups?$filter=mail eq '...' → resolve email to ID
-          - GET /groups/{id}/members → get members
+          - GET /groups/{id}/transitiveMembers → get direct and nested members
           - GET /users/{id} → get user UPN
     log_fn : callable(message, level)
         Logging callback.
@@ -140,7 +140,10 @@ def expand_group_to_users(
             _log(f"Resolved to ObjectId: {group_id}", 'info')
 
         # --- Get group members ---
-        members_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/members"
+        # v1.11.15 expands nested groups too.  The Graph endpoint preserves
+        # pagination and returns users alongside non-user directory objects;
+        # the filtering below remains deliberately user-only.
+        members_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/transitiveMembers"
         all_members: List[Dict[str, Any]] = []
 
         # Pagination support
@@ -247,4 +250,3 @@ def disconnect_purview_audit(
     except Exception:
         _log("(Microsoft Graph disconnection skipped or already disconnected)", 'info')
         return True
-

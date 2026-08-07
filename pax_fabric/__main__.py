@@ -104,6 +104,7 @@ from .mod13_pax_dual_mode import (
     _is_transient,
     disconnect_purview_audit,
     expand_group_to_users,
+    resolve_pax_user_scope,
 )
 from .mod14_pax_remote_output import (
     invoke_output_upload,
@@ -1110,16 +1111,10 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         return elapsed
 
     # Expand group memberships to target users
+    # PS parity: Resolve-PaxUserScope combines UserIds + GroupNames into one
+    # deduplicated scope. Resolution requires an authenticated Graph session,
+    # so the actual call happens after `session`/`token` are constructed below.
     target_users = None
-    if getattr(config, 'group_names', None):
-        all_group_users: list[str] = []
-        for group_name in config.group_names:
-            users = expand_group_to_users(
-                group_identity=group_name,
-                log_fn=lambda msg, lvl='INFO': write_log(msg, level=lvl),
-            )
-            all_group_users.extend(users)
-        target_users = list(dict.fromkeys(all_group_users)) or None  # dedupe
 
     # Resolve activity types
     activity_types = resolve_activity_types(config)
@@ -1213,6 +1208,70 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # Auto-detect Graph API version (PS: Get-GraphAuditApiUri auto-detection L7884)
     api_version = detect_graph_audit_api_version(session)
     ctx.graph_api_version = api_version
+
+    # --- Resolve target user scope (PS parity: Resolve-PaxUserScope) ---
+    # Combines UserIds + GroupNames into a deduplicated union of UPNs and
+    # fails closed if any group is missing, ambiguous, empty, or errors —
+    # this prevents silent degradation to a full-tenant query.
+    _requested_user_ids = list(getattr(config, 'user_ids', None) or [])
+    _requested_group_names = list(getattr(config, 'group_names', None) or [])
+    if _requested_user_ids or _requested_group_names:
+        def _scope_graph_get(_method: str, _url: str) -> dict:
+            # Thin wrapper so mod13 can call Graph without knowing about
+            # requests/sessions. Raises on HTTP errors so failure
+            # classification can inspect the status code.
+            resp = session.get(_url, timeout=60)
+            resp.raise_for_status()
+            try:
+                return resp.json() or {}
+            except ValueError:
+                return {}
+
+        _scope = resolve_pax_user_scope(
+            user_ids=_requested_user_ids,
+            group_names=_requested_group_names,
+            graph_request_fn=_scope_graph_get,
+            log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
+        )
+
+        if _scope.outcome != 'Succeeded':
+            # PS parity: fail closed rather than run an unfiltered query.
+            _details = []
+            if _scope.failed_groups:
+                _details.append(f"not found: {_scope.failed_groups}")
+            if _scope.ambiguous_groups:
+                _details.append(f"ambiguous: {_scope.ambiguous_groups}")
+            if _scope.zero_member_groups:
+                _details.append(f"no user members: {_scope.zero_member_groups}")
+            if _scope.unauthorized_groups:
+                _details.append(f"unauthorized: {_scope.unauthorized_groups}")
+            if _scope.transport_error_groups:
+                _details.append(f"transport error: {_scope.transport_error_groups}")
+            if _scope.resolution_error_groups:
+                _details.append(f"resolution error: {_scope.resolution_error_groups}")
+            _detail_msg = "; ".join(_details) if _details else "no group details"
+            raise RuntimeError(
+                f"User scope resolution failed ({_scope.failure_stage}): "
+                f"{_detail_msg}. Aborting to avoid an unfiltered full-tenant "
+                "query. Verify group identifiers, membership, and that the "
+                "app has GroupMember.Read.All."
+            )
+
+        target_users = list(_scope.final_target_users) or None
+        # Belt-and-braces: if scoping was explicitly requested we must have at
+        # least one target user; empty here would mean silent full-tenant.
+        if target_users is None:
+            raise RuntimeError(
+                "User scope resolution produced zero target users despite "
+                "UserIds/GroupNames being set. Aborting to avoid an "
+                "unfiltered full-tenant query."
+            )
+        write_log(
+            "Target user scope resolved: "
+            f"{len(_scope.matched_explicit_user_ids) + len(_scope.unmatched_explicit_user_ids)} "
+            f"explicit user(s), {len(_scope.resolved_groups)} group(s), "
+            f"{len(target_users)} unique UPN(s) after dedup"
+        )
 
     # --- Build query_fn factory for invoke_activity_time_window_processing ---
     # Each partition thread needs its own HTTP session (thread-safe isolation).

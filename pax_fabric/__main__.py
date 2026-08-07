@@ -1115,6 +1115,9 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # deduplicated scope. Resolution requires an authenticated Graph session,
     # so the actual call happens after `session`/`token` are constructed below.
     target_users = None
+    # PS L31428-L31432 parity: Graph API doesn't support UPN filtering server-side,
+    # so a lowercase set is precomputed once for O(1) client-side filtering below.
+    target_users_set_lower: set[str] | None = None
 
     # Resolve activity types
     activity_types = resolve_activity_types(config)
@@ -1266,6 +1269,11 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 "UserIds/GroupNames being set. Aborting to avoid an "
                 "unfiltered full-tenant query."
             )
+        # PS L31428-L31432 parity: case-insensitive UPN set consumed by
+        # _query_fn (non-flush path) and _page_spill (memory-flush path).
+        target_users_set_lower = {
+            u.strip().lower() for u in target_users if u and u.strip()
+        }
         write_log(
             "Target user scope resolved: "
             f"{len(_scope.matched_explicit_user_ids) + len(_scope.unmatched_explicit_user_ids)} "
@@ -2003,6 +2011,21 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
 
         # Normalize Graph records to EOM-compatible schema
         normalized = convert_from_graph_audit_record(raw_records)
+
+        # PS L31428-L31432 parity: Graph API has no server-side UPN filter,
+        # so apply the resolved user scope client-side before returning.
+        if target_users_set_lower and normalized:
+            _before_filter = len(normalized)
+            normalized = [
+                r for r in normalized
+                if ((r.get('UserIds') or r.get('UserId') or '')
+                    .strip().lower() in target_users_set_lower)
+            ]
+            write_log(
+                f"{log_prefix} [Graph API] Applied UserIds scope filter: "
+                f"{_before_filter} \u2192 {len(normalized)} records",
+                level="INFO",
+            )
         return normalized
 
     # --- Create orchestrator state ---
@@ -2277,6 +2300,24 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         normalized = convert_from_graph_audit_record(raw_page)
                         if not normalized:
                             return
+                        # PS L31428-L31432 parity: filter client-side before
+                        # persistence so streamed shards match the resolved scope.
+                        if target_users_set_lower:
+                            _before_filter = len(normalized)
+                            normalized = [
+                                r for r in normalized
+                                if ((r.get('UserIds') or r.get('UserId') or '')
+                                    .strip().lower() in target_users_set_lower)
+                            ]
+                            if _before_filter != len(normalized):
+                                write_log(
+                                    f"  [Graph API] Partition {_p} page-flush "
+                                    f"UserIds scope filter: {_before_filter} "
+                                    f"\u2192 {len(normalized)} records",
+                                    level="INFO",
+                                )
+                            if not normalized:
+                                return
                         # PS parity: append (do NOT truncate) on first page
                         # of a retry. Phase 6 drainage dedups by RecordId/Id
                         # via seen_ids, so overlap from a prior failed pass

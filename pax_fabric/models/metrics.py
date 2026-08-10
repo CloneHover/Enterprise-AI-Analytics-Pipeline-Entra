@@ -120,3 +120,10 @@ class PAXMetrics:
     records_salvaged_after_auth: int = 0
     data_loss_events: list[str] = field(default_factory=list)
 
+    # --- Directory (Entra) enrichment visibility ---
+    # Set True when the Entra user-directory (org/manager) enrichment fetch
+    # fails after the main audit data has already been written successfully.
+    # Surfaces as exit code 30 ("Directory fetch") rather than a fatal error,
+    # since the primary audit output is still usable.
+    entra_directory_fetch_failed: bool = False
+

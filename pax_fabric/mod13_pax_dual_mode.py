@@ -167,22 +167,16 @@ def resolve_pax_user_scope(
 
     Parameters
     ----------
-    user_ids : list[str], optional
-        Explicit UPNs to include verbatim. Deduplicated case-insensitively,
-        preserving first-seen casing. Always contribute to ``final_target_users``.
-    group_names : list[str], optional
-        Group identifiers (GUID, displayName, mail, or mailNickname). Each is
-        resolved to a single group and expanded to its transitive user members.
-    graph_request_fn : callable(method, url) -> dict
-        Injected Graph API request function. Must return a dict with ``value``
-        and (optionally) ``@odata.nextLink`` for paginated collections. Must
-        raise on HTTP errors so failure classification can inspect the status.
-    log_fn : callable(message, level), optional
-        Logging callback where level is one of 'info', 'warn', 'error'.
-    roster_validator : callable(upn) -> bool, optional
-        Optional predicate that classifies each requested UPN as matched/
-        unmatched in the tenant roster. Unmatched UPNs still contribute to
-        ``final_target_users`` (parity with PS) — this bucket is diagnostic only.
+    group_identity : str
+        Group identifier — display name, email address, or ObjectId (GUID).
+    graph_request_fn : callable(method, url) -> response dict
+        Graph API request function. Used for:
+          - GET /groups?$filter=displayName eq '...' → resolve name to ID
+          - GET /groups?$filter=mail eq '...' → resolve email to ID
+          - GET /groups/{id}/transitiveMembers → get direct and nested members
+          - GET /users/{id} → get user UPN
+    log_fn : callable(message, level)
+        Logging callback.
 
     Returns
     -------
@@ -439,31 +433,79 @@ def expand_group_to_users(
         misconfigured group can never silently degrade the run to an
         unfiltered full-tenant query.
 
-    Parameters
-    ----------
-    group_identity : str
-        Group identifier — display name, mail, mailNickname, or ObjectId (GUID).
-    graph_request_fn : callable(method, url) -> response dict
-        Graph API request function. Must raise on HTTP errors.
-    log_fn : callable(message, level)
-        Logging callback (levels: 'info', 'warn', 'error').
-    """
-    if not group_identity or not str(group_identity).strip():
-        return []
+            # Fallback: try by mail
+            if not group_id:
+                mail_url = f"https://graph.microsoft.com/v1.0/groups?$filter=mail eq '{escaped}'"
+                try:
+                    resp = graph_request_fn('GET', mail_url)
+                    values = resp.get('value', []) if resp else []
+                    if values:
+                        group_id = values[0].get('id')
+                except Exception:
+                    pass
 
-    result = resolve_pax_user_scope(
-        group_names=[group_identity],
-        graph_request_fn=graph_request_fn,
-        log_fn=log_fn,
-    )
-    if result.outcome != 'Succeeded':
-        raise RuntimeError(
-            f"Failed to expand group '{group_identity}' "
-            f"({result.failure_stage}). Verify the group exists, the "
-            "identifier is unambiguous, it has user members, and the app "
-            "has GroupMember.Read.All."
-        )
-    return list(result.resolved_transitive_members)
+            if not group_id:
+                raise RuntimeError(f"Unable to find group with identifier: {group_identity}")
+
+            _log(f"Resolved to ObjectId: {group_id}", 'info')
+
+        # --- Get group members ---
+        # v1.11.15 expands nested groups too.  The Graph endpoint preserves
+        # pagination and returns users alongside non-user directory objects;
+        # the filtering below remains deliberately user-only.
+        members_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/transitiveMembers"
+        all_members: List[Dict[str, Any]] = []
+
+        # Pagination support
+        next_url: Optional[str] = members_url
+        while next_url:
+            resp = graph_request_fn('GET', next_url)
+            if not resp:
+                break
+            page_values = resp.get('value', [])
+            if page_values:
+                all_members.extend(page_values)
+            next_url = resp.get('@odata.nextLink')
+
+        # --- Filter to users and extract UPN ---
+        for member in all_members:
+            odata_type = ''
+            # Check additionalProperties or direct @odata.type
+            if isinstance(member, dict):
+                odata_type = member.get('@odata.type', '')
+                if not odata_type:
+                    # PS: $member.AdditionalProperties.'@odata.type'
+                    props = member.get('additionalProperties', {})
+                    if isinstance(props, dict):
+                        odata_type = props.get('@odata.type', '')
+
+            if odata_type == '#microsoft.graph.user':
+                # Try to get UPN directly from member object
+                upn = member.get('userPrincipalName', '')
+                if upn:
+                    members.append(upn)
+                else:
+                    # Need to fetch full user object
+                    member_id = member.get('id', '')
+                    if member_id:
+                        try:
+                            user_url = f"https://graph.microsoft.com/v1.0/users/{member_id}"
+                            user = graph_request_fn('GET', user_url)
+                            if user and user.get('userPrincipalName'):
+                                members.append(user['userPrincipalName'])
+                        except Exception:
+                            pass
+
+        _log(f"Expanded: {len(members)} user member(s)", 'info')
+
+    except Exception as e:
+        _log(f"Warning: Failed to expand group '{group_identity}': {e}", 'warn')
+        _log("Possible causes:", 'warn')
+        _log("  - Group does not exist or identifier is invalid", 'warn')
+        _log("  - Insufficient permissions (need GroupMember.Read.All)", 'warn')
+        _log("  - Network connectivity issues with Graph API", 'warn')
+
+    return members
 
 
 # ---------------------------------------------------------------------------
@@ -518,4 +560,3 @@ def disconnect_purview_audit(
     except Exception:
         _log("(Microsoft Graph disconnection skipped or already disconnected)", 'info')
         return True
-

@@ -339,16 +339,24 @@ def merge_fact_csv(
     target_csv: str,
     current_csv: str,
     output_path: str,
-    key_column: str = "Message_Id_Raw",
+    key_column: "str | list[str]" = "Message_Id_Raw",
     run_date: Optional[str] = None,
 ) -> dict:
     """Union-merge a target Fact CSV with the current run's Fact CSV.
 
     PS Merge-FactCsv (L7739–L7936):
     - Merge key: key_column parameter (default 'Message_Id_Raw' for rollup,
-      pass 'RecordId' for raw audit CSV)
-    - Retained (in both): keep target's Date_Added; for Message_Id_Raw key,
-      also carry target's Message_Id INT (continuity)
+      pass 'RecordId' for raw audit CSV). ``key_column`` may also be a list of
+      column names, in which case rows are keyed on the COMPOSITE of those
+      columns (pipe-joined). This matters for the rollup Fact CSV: one
+      Message_Id_Raw can map to MULTIPLE rows (one per distinct grain, e.g.
+      per accessed resource for AIBV's grain-promoted resource flags), so
+      keying on Message_Id_Raw alone would collapse those fan-out rows in the
+      Departed classification. Pass the full grain column list +
+      'Message_Id_Raw' as a composite key for rollup Fact merges to preserve
+      fan-out rows correctly.
+    - Retained (in both): keep target's Date_Added; for a key that includes
+      'Message_Id_Raw', also carry target's Message_Id INT (continuity)
     - New (only in current): mint Date_Added=run_date
     - Departed (only in target): carry forward; In_Latest_Append=FALSE
     - Latest_Append_Date = run_date on every row
@@ -358,7 +366,8 @@ def merge_fact_csv(
         target_csv: Path to the existing/seed Fact CSV (may not exist).
         current_csv: Path to the current run's freshly-emitted Fact CSV.
         output_path: Where to write the union CSV.
-        key_column: Column name to use as the dedup key.
+        key_column: Column name (or list of column names for a composite key)
+            to use as the dedup key.
         run_date: Date stamp (default: today as 'yyyy-MM-dd').
 
     Returns:
@@ -372,32 +381,42 @@ def merge_fact_csv(
             f"Merge-FactCsv: current Fact CSV not found: '{current_csv}'"
         )
 
+    # Normalize key_column to a list of columns; single-string callers get the
+    # exact prior behavior (composite key of length 1 == plain single-column key).
+    key_columns = [key_column] if isinstance(key_column, str) else list(key_column)
+    uses_message_id_raw = "Message_Id_Raw" in key_columns
+    _KEY_SEP = "\x1f"  # unit separator: won't collide with real column values
+
+    def _row_key(row: dict) -> str:
+        return _KEY_SEP.join(str(row.get(c, "")).strip() for c in key_columns)
+
     target_rows = import_csv_deduped(target_csv) if os.path.isfile(target_csv) else []
     current_rows = import_csv_deduped(current_csv)
 
-    # Warn if target is missing the key column
+    # Warn if target is missing any key column
     if target_rows:
         target_headers = list(target_rows[0].keys())
-        if key_column not in target_headers:
+        missing_cols = [c for c in key_columns if c not in target_headers]
+        if missing_cols:
             logger.warning(
-                "Merge-FactCsv: target Fact CSV is missing dedup key column '%s'. "
+                "Merge-FactCsv: target Fact CSV is missing dedup key column(s) %s. "
                 "Cannot classify Retained / New / Departed rows reliably; "
                 "treating ALL current-run rows as New. Target: %s",
-                key_column,
+                missing_cols,
                 target_csv,
             )
 
     # Build dedup indexes
     target_by_key: dict[str, dict] = {}
     for row in target_rows:
-        k = row.get(key_column, "").strip()
-        if k and k not in target_by_key:
+        k = _row_key(row)
+        if k.strip(_KEY_SEP) and k not in target_by_key:
             target_by_key[k] = row
 
     current_by_key: dict[str, dict] = {}
     for row in current_rows:
-        k = row.get(key_column, "").strip()
-        if k and k not in current_by_key:
+        k = _row_key(row)
+        if k.strip(_KEY_SEP) and k not in current_by_key:
             current_by_key[k] = row
 
     # Header union: current-run order first, then target-only, then provenance
@@ -423,14 +442,15 @@ def merge_fact_csv(
 
     # 1. Current-run rows (retained + new)
     for row in current_rows:
-        k = row.get(key_column, "").strip()
+        k = _row_key(row)
         obj = {c: "" for c in hdr_order}
         obj.update(row)
 
-        if k and k in target_by_key:
+        if k.strip(_KEY_SEP) and k in target_by_key:
             tr = target_by_key[k]
-            # For Message_Id_Raw key: target's Message_Id INT wins (continuity)
-            if key_column == "Message_Id_Raw":
+            # Continuity: target's Message_Id INT wins whenever the key
+            # incorporates Message_Id_Raw (single-column or composite).
+            if uses_message_id_raw:
                 tr_mid = tr.get("Message_Id", "").strip()
                 if tr_mid:
                     obj["Message_Id"] = tr_mid
@@ -487,3 +507,227 @@ def merge_fact_csv(
         "Departed": departed_count,
         "Union": union_count,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL MERGE-SORT ENGINE (v1.11.15 parity: PS Invoke-PaxExternalSort /
+# Merge-PaxSortedRuns / Read-PaxCsvRecord / Write-PaxCsvRecord)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Additive, opt-in scalable path for very large append/rollup merges.
+# merge_users_csv() / merge_fact_csv() above load both input files fully into
+# memory (fine for typical run sizes); this engine instead:
+#   1. Streams each input file, sorting it into bounded-size chunks
+#      (default 50,000 rows) written to temp CSVs ("sorted runs").
+#   2. K-way merges the sorted runs with heapq.merge (streams rows through
+#      exactly ONE row per key held in memory at a time per active run).
+#   3. Applies caller-specified dedup precedence on duplicate keys as rows
+#      are merged, writing the result directly to ``output_path``.
+# Peak memory is O(chunk_rows) + O(number of runs), not O(total rows) —
+# unlike the in-memory merge functions above, this scales to files that
+# don't fit in memory. Callers should switch to this path once input size
+# crosses a size/row-count threshold they define (e.g. > 500K rows).
+
+import heapq
+import tempfile
+import uuid
+
+
+def _write_sorted_chunk(rows: list[dict], fieldnames: list[str], tmp_dir: str) -> str:
+    """Sort ``rows`` in memory (already assumed to be one bounded chunk) and
+    write them to a new temp CSV file under ``tmp_dir``. Returns the path."""
+    chunk_path = os.path.join(tmp_dir, f"pax_sort_chunk_{uuid.uuid4().hex}.csv")
+    with open(chunk_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return chunk_path
+
+
+def external_sort_csv_by_key(
+    input_path: str,
+    key_fn,
+    tmp_dir: Optional[str] = None,
+    *,
+    chunk_rows: int = 50_000,
+) -> tuple[list[str], list[str]]:
+    """External (disk-backed) sort of ``input_path`` by ``key_fn(row) -> str``.
+
+    Reads the input CSV in bounded-size chunks (``chunk_rows`` rows at a
+    time), sorts each chunk in memory, and writes it to its own temp CSV
+    ("sorted run"). Peak memory is O(chunk_rows) regardless of total file
+    size. Returns ``(chunk_paths, fieldnames)`` — caller is responsible for
+    deleting the chunk files (or use :func:`k_way_merge_sorted_chunks` /
+    :func:`external_merge_append_csv`, which clean up automatically).
+    """
+    if tmp_dir is None:
+        tmp_dir = tempfile.gettempdir()
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    if not os.path.isfile(input_path):
+        return [], []
+
+    chunk_paths: list[str] = []
+    fieldnames: list[str] = []
+    buffer: list[dict] = []
+
+    with open(input_path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        fieldnames = list(reader.fieldnames or [])
+        for row in reader:
+            buffer.append(dict(row))
+            if len(buffer) >= chunk_rows:
+                buffer.sort(key=key_fn)
+                chunk_paths.append(_write_sorted_chunk(buffer, fieldnames, tmp_dir))
+                buffer = []
+        if buffer:
+            buffer.sort(key=key_fn)
+            chunk_paths.append(_write_sorted_chunk(buffer, fieldnames, tmp_dir))
+
+    return chunk_paths, fieldnames
+
+
+def k_way_merge_sorted_chunks(
+    chunk_paths: list[str],
+    key_fn,
+    *,
+    dedup: str = "last",
+    cleanup: bool = True,
+):
+    """K-way merge already-sorted chunk CSVs (as produced by
+    :func:`external_sort_csv_by_key`) into a single de-duplicated stream,
+    yielding one row dict at a time (never materializes the full result).
+
+    ``dedup``:
+        'last'  — when multiple rows share a key, the row from the
+                  chunk LATER in ``chunk_paths`` wins (append/new-data-wins).
+        'first' — the row from the chunk EARLIER in ``chunk_paths`` wins
+                  (original-data-wins / preserve-first-seen).
+
+    Chunk files are deleted after the merge completes (or on error) unless
+    ``cleanup=False``.
+    """
+    if dedup not in ("first", "last"):
+        raise ValueError("dedup must be 'first' or 'last'")
+
+    handles = []
+    try:
+        readers = []
+        for idx, path in enumerate(chunk_paths):
+            fh = open(path, "r", encoding="utf-8-sig", newline="")
+            handles.append(fh)
+            reader = csv.DictReader(fh)
+            readers.append((idx, reader))
+
+        def _stream(idx: int, reader):
+            for row in reader:
+                d = dict(row)
+                yield (key_fn(d), idx, d)
+
+        streams = [_stream(idx, reader) for idx, reader in readers]
+
+        # heapq.merge is stable per input order given equal first elements;
+        # tie-break explicitly on chunk index so 'first'/'last' precedence is
+        # deterministic regardless of heapq's internal comparison order.
+        merged_stream = heapq.merge(*streams, key=lambda t: (t[0], t[1]))
+
+        pending_key = None
+        pending_row = None
+        pending_idx = -1
+        for key, idx, row in merged_stream:
+            if pending_key is not None and key == pending_key:
+                # Duplicate key — apply precedence.
+                if dedup == "last" and idx >= pending_idx:
+                    pending_row, pending_idx = row, idx
+                elif dedup == "first" and idx < pending_idx:
+                    pending_row, pending_idx = row, idx
+                continue
+            if pending_key is not None:
+                yield pending_row
+            pending_key, pending_row, pending_idx = key, row, idx
+        if pending_key is not None:
+            yield pending_row
+    finally:
+        for fh in handles:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if cleanup:
+            for path in chunk_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def external_merge_append_csv(
+    existing_path: str,
+    new_path: str,
+    key_fn,
+    output_path: str,
+    *,
+    dedup: str = "last",
+    chunk_rows: int = 50_000,
+    tmp_dir: Optional[str] = None,
+) -> dict:
+    """Scalable, bounded-memory append merge of two CSV files by an arbitrary
+    key function, for datasets too large to hold in memory at once.
+
+    Both ``existing_path`` (prior accumulated history) and ``new_path``
+    (this run's fresh rows) are externally sorted into chunks and then
+    k-way merged with ``dedup='last'`` (default — a row present in BOTH
+    files is resolved from ``new_path``, matching the in-memory
+    ``merge_fact_csv``/``merge_users_csv`` "current run wins on conflict"
+    semantics) or ``dedup='first'`` (existing wins). The header is the
+    union of both files' fieldnames (existing-file order first, then any
+    new-only columns), written via :class:`csv.DictWriter` with
+    ``extrasaction='ignore'``. Result is written atomically (temp file +
+    rename) to ``output_path``.
+
+    Returns ``{"TotalRows": int, "ChunkCount": int}``.
+    """
+    if tmp_dir is None:
+        tmp_dir = tempfile.gettempdir()
+
+    existing_chunks, existing_fields = external_sort_csv_by_key(
+        existing_path, key_fn, tmp_dir, chunk_rows=chunk_rows
+    )
+    new_chunks, new_fields = external_sort_csv_by_key(
+        new_path, key_fn, tmp_dir, chunk_rows=chunk_rows
+    )
+
+    fieldnames: list[str] = list(existing_fields)
+    seen_lower = {f.lower() for f in fieldnames}
+    for f in new_fields:
+        if f.lower() not in seen_lower:
+            seen_lower.add(f.lower())
+            fieldnames.append(f)
+
+    if not fieldnames:
+        # Both inputs absent/empty — nothing to merge.
+        return {"TotalRows": 0, "ChunkCount": 0}
+
+    # existing_path's chunks come first in the list so dedup='last' resolves
+    # ties in favor of new_path (matches the in-memory merge semantics).
+    all_chunks = existing_chunks + new_chunks
+
+    tmp_out = output_path + ".merging"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    total_rows = 0
+    try:
+        with open(tmp_out, "w", encoding="utf-8", newline="") as out_fh:
+            writer = csv.DictWriter(out_fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in k_way_merge_sorted_chunks(all_chunks, key_fn, dedup=dedup):
+                writer.writerow(row)
+                total_rows += 1
+        shutil.move(tmp_out, output_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except OSError:
+            pass
+        raise
+
+    return {"TotalRows": total_rows, "ChunkCount": len(all_chunks)}

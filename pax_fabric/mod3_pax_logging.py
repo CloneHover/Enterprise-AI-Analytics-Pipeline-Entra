@@ -673,6 +673,153 @@ def set_progress_counters(
         _progress_state[phase_key]["total"] = total
 
 
+# ===========================================================================
+# MEMORY / HEARTBEAT OBSERVABILITY (v1.11.15 parity: PS Write-PaxMemoryObservation)
+# ===========================================================================
+# Lightweight, additive heartbeat: samples this process's working set and
+# managed heap, an optional child-process working set, rows/pages processed,
+# and temp-storage bytes, then appends ONE diagnostic line to the run log
+# (write_log_file — never echoed to console). No new required output file is
+# created and it NEVER surfaces identifying row values. Emission is throttled
+# to ``interval_seconds`` (default 30s) unless ``force=True``. Every metric
+# read is guarded so a missing child process or inaccessible counter can
+# never crash the run. Observation only — changes no success/failure result.
+
+_pax_last_mem_obs_utc: Optional[datetime] = None
+_pax_mem_obs_list: Optional[list[dict[str, Any]]] = None
+
+
+def enable_memory_observation_sink() -> list[dict[str, Any]]:
+    """Enable the optional in-memory metrics sink and return it (append-only
+    list of observation dicts). Mirrors PS ``$script:PaxMemObsList``."""
+    global _pax_mem_obs_list
+    if _pax_mem_obs_list is None:
+        _pax_mem_obs_list = []
+    return _pax_mem_obs_list
+
+
+def _process_working_set_bytes(pid: Optional[int] = None) -> Optional[int]:
+    """Best-effort RSS/working-set bytes for the given pid (current process
+    when omitted). Tries ``psutil`` first (accurate, cross-platform), then
+    falls back to ``resource.getrusage`` (Linux/macOS, self only). Returns
+    ``None`` rather than raising when unavailable."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        proc = psutil.Process(pid) if pid is not None else psutil.Process()
+        return int(proc.memory_info().rss)
+    except Exception:
+        pass
+    if pid is None or pid == os.getpid():
+        try:
+            import resource
+
+            # ru_maxrss is KB on Linux, bytes on macOS (Darwin).
+            raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return int(raw * 1024) if sys.platform != "darwin" else int(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _directory_size_bytes(path: str) -> Optional[int]:
+    """Sum of file sizes under ``path`` (recursive). Returns ``None`` on any
+    error (missing dir, permission issue) rather than raising."""
+    try:
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return total
+    except Exception:
+        return None
+
+
+def write_pax_memory_observation(
+    stage: str = "",
+    *,
+    child_pid: Optional[int] = None,
+    rows_processed: Optional[int] = None,
+    pages_processed: Optional[int] = None,
+    temp_dir: str = "",
+    force: bool = False,
+    interval_seconds: int = 30,
+) -> None:
+    """Sample process memory + progress counters and append one MEMOBS line
+    to the log file. Throttled to ``interval_seconds`` unless ``force=True``.
+    Never raises — every failure path is swallowed so this is pure
+    observability with zero effect on run success/failure."""
+    global _pax_last_mem_obs_utc
+    try:
+        now_utc = datetime.utcnow()
+        if not force and _pax_last_mem_obs_utc is not None:
+            if (now_utc - _pax_last_mem_obs_utc).total_seconds() < interval_seconds:
+                return
+        _pax_last_mem_obs_utc = now_utc
+
+        pid = os.getpid()
+        parent_ws = _process_working_set_bytes()
+        heap_bytes: Optional[int] = None
+        try:
+            import tracemalloc
+
+            if tracemalloc.is_tracing():
+                heap_bytes = tracemalloc.get_traced_memory()[0]
+        except Exception:
+            heap_bytes = None
+        child_ws = _process_working_set_bytes(child_pid) if child_pid is not None else None
+        temp_bytes = _directory_size_bytes(temp_dir) if temp_dir and os.path.isdir(temp_dir) else None
+
+        parts: list[str] = [f"ts={now_utc.isoformat()}Z"]
+        if stage:
+            parts.append(f"stage={stage}")
+        parts.append(f"pid={pid}")
+        if parent_ws is not None:
+            parts.append(f"parentWS_MB={parent_ws / (1024 * 1024):.1f}")
+        if heap_bytes is not None:
+            parts.append(f"heap_MB={heap_bytes / (1024 * 1024):.1f}")
+        if child_pid is not None:
+            parts.append(f"childPID={child_pid}")
+        if child_ws is not None:
+            parts.append(f"childWS_MB={child_ws / (1024 * 1024):.1f}")
+        if rows_processed is not None:
+            parts.append(f"rows={rows_processed}")
+        if pages_processed is not None:
+            parts.append(f"pages={pages_processed}")
+        if temp_bytes is not None:
+            parts.append(f"tempBytes={temp_bytes}")
+
+        try:
+            write_log_file("MEMOBS " + " ".join(parts))
+        except Exception:
+            pass
+
+        if _pax_mem_obs_list is not None:
+            try:
+                _pax_mem_obs_list.append(
+                    {
+                        "ts": now_utc.isoformat() + "Z",
+                        "stage": stage,
+                        "pid": pid,
+                        "parentWSBytes": parent_ws,
+                        "heapBytes": heap_bytes,
+                        "childPID": child_pid,
+                        "childWSBytes": child_ws,
+                        "rows": rows_processed,
+                        "pages": pages_processed,
+                        "tempBytes": temp_bytes,
+                    }
+                )
+            except Exception:
+                pass
+    except Exception:
+        # Observation must never affect run success/failure.
+        pass
+
+
 if __name__ == "__main__":
     ok = True
     errors: list[str] = []

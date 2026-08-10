@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Purview M365 Usage Bundle Explosion Processor v2.6.0
+Purview M365 Usage Bundle Explosion Processor v2.6.2
 =====================================================
 Two-mode processor for Purview audit log CSV exports:
 
@@ -10,24 +10,6 @@ Two-mode processor for Purview audit log CSV exports:
       with EventCount, MIN(CreationTime), MAX(CreationTime), IsAgentInteraction.
       Targets 80%+ row reduction for Power BI ingestion.
       Streaming — no exploded rows held in memory.
-
-  v2.3.0 CHANGES (validated against MS Learn audit-log schema + DAX TMDL fingerprint):
-      • Canonical Operation names enforced. Three legacy/wrong names auto-renamed at
-        intake (OP_RENAME), preserving historical data while emitting canonical values:
-            FileViewed                 → FileAccessed
-            MeetingParticipantJoined   → MeetingParticipantDetail
-            ConnectedAIAppInteraction  → AIAppInteraction
-      • TEAMS_OPS / FILE_OPS / COPILOT_OPS updated to the 14 DAX-required ops only.
-      • Rollup CSV header extended with 4 agent telemetry columns (AgentId, AgentName,
-        ContextType, IsAgentInteraction) so M365Usage.tmdl fingerprint check passes
-        without Power Query post-processing.
-      • Multi-file input supported: pass --input/-i multiple paths (or repeat the flag)
-        to combine N Purview exports into one rollup + UserStats + SessionCohort bundle.
-        Validated 4-pull strategy: Teams + Outlook + Files + Copilot in a single run.
-      • is_copilot() now also recognises AIAppInteraction (agent/connected-app events).
-      • All performance characteristics preserved: streaming intake, orjson, no buffered
-        explosion, per-record cap. Goal is to move processing OUT of Power BI INTO Python
-        so the .pbix loads/refreshes faster without losing fidelity.
 
       After the rollup CSV is written, a second pass streams through it to produce
       two additional analytics files (unless --no-userstats is specified):
@@ -41,7 +23,7 @@ Two-mode processor for Purview audit log CSV exports:
       recalculating expensive DAX/M expressions, cutting dashboard load times.
 
   EVENT-LEVEL MODE (--mode event-level):  v1-compatible 153-column explosion output.
-      Identical behavior to v1.0.0 for debugging and reconciliation.
+      For debugging and reconciliation.
       UserStats and SessionCohort files are NOT generated in this mode.
 
 Requirements:
@@ -50,10 +32,10 @@ Requirements:
 
 Usage:
     # (A) Single PAX / PowerShell export:
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py --pax <CSV>
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py --pax <CSV>
 
     # (B) Manual 4-pull export from Purview Audit:
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py \
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py \
         --teams <CSV> --outlook <CSV> --files <CSV> --copilot <CSV>
 
     Common optional flags:
@@ -68,10 +50,13 @@ Output files (rollup mode — all share the same timestamp):
     <stem>_Rollup_<YYYYMMDD_HHMMSS>.csv         13 columns — aggregated events + agent fields
     <stem>_UserStats_<YYYYMMDD_HHMMSS>.csv      66 columns — per-user metrics
     <stem>_SessionCohort_<YYYYMMDD_HHMMSS>.csv   3 columns — (UserId, App, Bucket)
-    <stem>_SessionStats_<YYYYMMDD_HHMMSS>.csv    7 columns — (UserId, Date, AppHost,
+    <stem>_SessionStats_<YYYYMMDD_HHMMSS>.csv    8 columns — (UserId, Date, AppHost,
                                                               SessionCount, PromptCount,
+                                                              AgentPromptCount,
                                                               ResponseCount, AgentSessionCount)
-                                                  matches AI in One DISTINCTCOUNT(ThreadId)
+                                                  matches AI in One DISTINCTCOUNT(ThreadId);
+                                                  AgentPromptCount = prompts on agent-flagged
+                                                  threads
     (<stem> = input file's stem for single input, or '<firstStem>_Combined' for multi-input.
      Rename the output file or use --output-dir if you want a tenant-specific name.)
 
@@ -90,24 +75,24 @@ Arguments:
 
 Examples:
     # Default rollup (13-column output + UserStats + SessionCohort)
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py -i Purview_Export.csv
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py -i Purview_Export.csv
 
     # Combine the validated 4-pull bundle (Teams + Outlook + Files + Copilot) in one run
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py \
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py \
         -i Teams_Export.csv Outlook_Export.csv Files_Export.csv Copilot_Export.csv \
         --combined-stem ZavaCorp_2025_11
 
     # Rollup with output in a different directory
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py -i Purview_Export.csv --output-dir ./output
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py -i Purview_Export.csv --output-dir ./output
 
     # Rollup only — skip UserStats and SessionCohort generation
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py -i Purview_Export.csv --no-userstats
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py -i Purview_Export.csv --no-userstats
 
     # v1-compatible event-level explosion (153-column output)
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py -i Purview_Export.csv --mode event-level
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py -i Purview_Export.csv --mode event-level
 
     # Rollup with sample-based reconciliation check
-    python Purview_M365_Usage_Bundle_Explosion_Processor_v2.6.0.py -i Purview_Export.csv --reconcile
+    python Purview_M365_Usage_Bundle_Explosion_Processor.py -i Purview_Export.csv --reconcile
 
 Validated 4-pull strategy (Purview Audit → Activities filter, type+click each chip):
     Teams   (7d):  MessageSent, MessageRead, ChatCreated, TeamsSessionStarted,
@@ -117,7 +102,6 @@ Validated 4-pull strategy (Purview Audit → Activities filter, type+click each 
     Copilot (30d): CopilotInteraction, AIAppInteraction        (filter by record type)
 
 Author:  Microsoft Copilot Growth ROI Advisory Team (copilot-roi-advisory-team-gh@microsoft.com)
-Version: 2.6.0
 """
 
 from __future__ import annotations
@@ -125,13 +109,15 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import hashlib
+import hmac
 import os
 import random
 import re
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 from typing import Any
@@ -166,7 +152,7 @@ except ImportError:
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-SCRIPT_VERSION = "2.6.0"
+SCRIPT_VERSION = "2.6.2"
 
 EXPLOSION_PER_RECORD_ROW_CAP = 1000
 STREAMING_CHUNK_SIZE = 5000
@@ -233,7 +219,7 @@ ROLLUP_HEADER: list[str] = [
 # Reconciliation sample size
 RECONCILE_SAMPLE_SIZE = 10_000
 
-# ── Operation canonicalization (v2.3.0) ──────────────────────────────────────
+# ── Operation canonicalization ──────────────────────────────────────
 # Legacy/wrong names that have appeared in older exports or older DAX models.
 # Renamed at intake so historical data merges cleanly with current canonical pulls.
 OP_RENAME: dict[str, str] = {
@@ -267,7 +253,7 @@ COPILOT_OPS: set[str] = {"CopilotInteraction", "AIAppInteraction"}  # AIAppInter
 # AppHost values that indicate an agent / connected-app interaction.
 AGENT_APPHOSTS: set[str] = {"agent", "copilotstudio", "declarativeagent", "customengineagent"}
 
-# ── DAX-aligned op/ext sets (for the CE/LP precomputed columns added in v2.4.0) ──
+# ── DAX-aligned op/ext sets (for the CE/LP precomputed columns) ──
 # These mirror the exact filters in the PBIT measures Word/Excel/PowerPoint/Outlook/
 # Teams Activity *V2, Copilot All Apps Total, and CE Copilot Percentile.
 # Important: ops are matched AFTER OP_RENAME canonicalization, so the legacy names
@@ -298,7 +284,7 @@ USERSTATS_HEADER: list[str] = [
     "TeamsActivitySegment", "OutlookActivitySegment", "WordActivitySegment",
     "ExcelActivitySegment", "PowerPointActivitySegment",
     "OfficeFilesActivitySegment", "OverallM365ActivitySegment",
-    # ── v2.5.0: precomputed raw activity counts + CE percentile ranks per window.
+    # ── Precomputed raw activity counts + CE percentile ranks per window.
     # Windows: _L30 = trailing 30 days ending at max(CreationDate); _L60 = trailing 60;
     # _Full  = entire data range. Filters match the corresponding DAX measures exactly
     # (post-canonicalization). CE ranks are integer 0-100; blank when raw is 0.
@@ -317,18 +303,21 @@ USERSTATS_HEADER: list[str] = [
     "CECopilotPercentile_L30", "CECopilotPercentile_L60", "CECopilotPercentile_Full",
 ]
 
-# v2.5.0: percentile window codes used in column names. Order matters for writer.
+# Percentile window codes used in column names. Order matters for writer.
 RANK_WINDOWS: tuple[str, ...] = ("L30", "L60", "Full")
 
 SESSIONCOHORT_HEADER: list[str] = ["UserId", "AppColumn", "SessionCohort"]
 
-# v2.6.0: SessionStats — AI in One parity. Per (UserId, CreationDate, AppHost) we count
+# SessionStats — AI in One parity. Per (UserId, CreationDate, AppHost) we count
 # DISTINCT ThreadIds (matches Microsoft AI in One `Sessions` measure), plus prompt /
 # response counts and an agent-only thread count. License filtering happens downstream
 # in DAX via the EntraUsers relationship; this CSV stays license-agnostic.
+# AgentPromptCount — exact chat vs agent split at message-tally time
+# (uses the same is_agent flag the rollup already determines per record).
 SESSIONSTATS_HEADER: list[str] = [
     "UserId", "CreationDate", "AppHost",
-    "SessionCount", "PromptCount", "ResponseCount", "AgentSessionCount",
+    "SessionCount", "PromptCount", "AgentPromptCount",
+    "ResponseCount", "AgentSessionCount",
 ]
 
 # Date formats accepted for CreationDate normalization (broadest to narrowest)
@@ -343,7 +332,7 @@ _CREATION_DATE_FORMATS: tuple[str, ...] = (
     "%m/%d/%Y",
 )
 
-# GroupKey type (v2.3.0): adds agent_id, agent_name, context_type so multi-agent users
+# GroupKey type: adds agent_id, agent_name, context_type so multi-agent users
 # don't collapse rows together. IsAgentInteraction is derived on write from AgentId.
 # (user_id_lower, creation_date_normalized, operation, workload, sfe_lower, app_host,
 #  agent_id, agent_name, context_type)
@@ -381,7 +370,7 @@ SessionKey = tuple[str, str, str]
 
 
 class SessionAccum:
-    """Per-(user, date, app_host) Copilot session accumulator (v2.6.0).
+    """Per-(user, date, app_host) Copilot session accumulator.
 
     Mirrors the AI in One `Sessions` measure: DISTINCTCOUNT(ThreadId) where at least
     one message in the thread is a user prompt (isPrompt=True). Threads with only
@@ -389,7 +378,7 @@ class SessionAccum:
     """
     __slots__ = (
         "thread_ids", "agent_thread_ids",
-        "prompt_count", "response_count",
+        "prompt_count", "agent_prompt_count", "response_count",
         "original_user_id",
     )
 
@@ -397,6 +386,7 @@ class SessionAccum:
         self.thread_ids: set[str] = set()
         self.agent_thread_ids: set[str] = set()
         self.prompt_count: int = 0
+        self.agent_prompt_count: int = 0  # prompts on agent-flagged threads
         self.response_count: int = 0
         self.original_user_id = original_uid
 
@@ -766,6 +756,139 @@ def _is_human_upn(uid: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Deidentification (--deidentify): one-way, salted, format-preserving.
+# OFF by default; enabled by main() setting the module flag from --deidentify
+# (and propagated to explosion worker processes via _deid_init_worker). Every
+# PII value becomes a deterministic token so relationships (user joins,
+# distinct-resource counts) are preserved while identities are removed.
+# Irreversible (no decode map). The SAME salt + algorithm + formats MUST exist
+# verbatim in the PowerShell raw-path deidentifier and the CopilotInteraction
+# processor (PAX deidentify spec) so tokens match across engines.
+# ---------------------------------------------------------------------------
+_DEIDENTIFY: bool = False
+_DEID_SALT = b"PAX-Deidentify-Salt-v1-DO-NOT-CHANGE-7f3c1e9b2d846050a1c4e8b3"
+_DEID_DOMAIN = "deidentified.domain"
+_deid_cache: dict[str, str] = {}
+
+
+def _deid_init_worker(flag: bool) -> None:
+    """ProcessPoolExecutor initializer: propagate the deidentify flag to workers."""
+    global _DEIDENTIFY
+    _DEIDENTIFY = flag
+
+
+def _deid_hex(value: str, length: int) -> str:
+    return hmac.new(
+        _DEID_SALT, value.strip().lower().encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:length]
+
+
+def deid_upn(value: str) -> str:
+    """UPN / email -> <12hex>@deidentified.domain. No-op when off or value empty."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "upn\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12) + "@" + _DEID_DOMAIN
+        _deid_cache[k] = v
+    return v
+
+
+def deid_name(value: str) -> str:
+    """Person/device display name -> <12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "name\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_guid(value: str) -> str:
+    """GUID -> deterministic GUID shape xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "guid\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        h = _deid_hex(value, 32)
+        v = f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+        _deid_cache[k] = v
+    return v
+
+
+def deid_sid(value: str) -> str:
+    """SID -> deterministic S-1-5-21-<d1>-<d2>-<d3>-<d4> shape."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "sid\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        h = _deid_hex(value, 32)
+        v = "S-1-5-21-{0}-{1}-{2}-{3}".format(
+            int(h[0:8], 16), int(h[8:16], 16), int(h[16:24], 16), int(h[24:32], 16)
+        )
+        _deid_cache[k] = v
+    return v
+
+
+def deid_token(value: str) -> str:
+    """Opaque id (employeeId, immutableId) -> <12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "tok\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_resource(value: str) -> str:
+    """Resource URL -> site_<12hex> (whole-string hash; preserves distinct-count)."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "res\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = "site_" + _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_file(value: str) -> str:
+    """File / document name -> file_<12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "file\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = "file_" + _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_proxy(value: str) -> str:
+    """proxyAddresses entry(ies) -> keep smtp:/SMTP: prefix + deidentified email.
+    Handles ';'-delimited multi-value fields."""
+    if not _DEIDENTIFY or not value:
+        return value
+    out = []
+    for entry in value.split(";"):
+        if not entry:
+            out.append(entry)
+        elif ":" in entry:
+            prefix, addr = entry.split(":", 1)
+            out.append(prefix + ":" + deid_upn(addr))
+        else:
+            out.append(deid_upn(entry))
+    return ";".join(out)
+
+
 def _extract_rollup_keys(
     record: dict,
     audit_data: dict,
@@ -1095,6 +1218,18 @@ def _build_unified_row(record: dict, audit_data: dict) -> dict:
         "AccessedResource_ResourceType": "",
         "Context_Item": "",
     }
+    if _DEIDENTIFY:
+        # Exploded (153-col) identity + resource fields. AccessedResource_SiteUrl/Name on
+        # Copilot rows are hashed in explode_copilot_record (set there after this returns).
+        row["UserId"] = deid_upn(row["UserId"])
+        row["MailboxOwnerUPN"] = deid_upn(row["MailboxOwnerUPN"])
+        row["MailboxGuid"] = deid_guid(row["MailboxGuid"])
+        row["LogonUserSid"] = deid_sid(row["LogonUserSid"])
+        row["MailboxOwnerSid"] = deid_sid(row["MailboxOwnerSid"])
+        row["DeviceDisplayName"] = deid_name(row["DeviceDisplayName"])
+        row["SiteUrl"] = deid_resource(row["SiteUrl"])
+        row["SourceRelativeUrl"] = deid_resource(row["SourceRelativeUrl"])
+        row["SourceFileName"] = deid_file(row["SourceFileName"])
     return row
 
 
@@ -1316,8 +1451,8 @@ def explode_copilot_record(
             res = resources[i]
             row["AccessedResource_Action"] = safe_get(res, "Action") or ""
             row["AccessedResource_PolicyDetails"] = to_json_if_object(safe_get(res, "PolicyDetails"))
-            row["AccessedResource_SiteUrl"] = safe_get(res, "SiteUrl") or ""
-            row["AccessedResource_Name"] = safe_get(res, "Name") or ""
+            row["AccessedResource_SiteUrl"] = deid_resource(safe_get(res, "SiteUrl") or "")
+            row["AccessedResource_Name"] = deid_file(safe_get(res, "Name") or "")
             row["AccessedResource_SensitivityLabel"] = safe_get(res, "SensitivityLabel") or ""
             row["AccessedResource_ResourceType"] = safe_get(res, "ResourceType") or ""
         else:
@@ -1478,70 +1613,86 @@ def run_explosion(
     if not quiet:
         print("Phase 2: Processing records...")
 
-    # Accumulate all exploded rows (we need dynamic columns before writing header)
-    all_rows: list[dict] = []
-
-    # Read CSV in chunks
-    chunks: list[list[dict]] = []
-    current_chunk: list[dict] = []
-
-    with open(input_csv, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            current_chunk.append(row)
-            if len(current_chunk) >= chunk_size:
-                chunks.append(current_chunk)
-                current_chunk = []
-        if current_chunk:
-            chunks.append(current_chunk)
-
-    total_input = sum(len(c) for c in chunks)
-    stats["input_records"] = total_input
-
-    if not quiet:
-        print(f"  Loaded {total_input:,} input records in {len(chunks)} chunk(s)")
-
-    # Determine whether to use multiprocessing
-    use_parallel = workers > 1 and len(chunks) > 1
-
-    if use_parallel:
-        chunk_args = [(chunk, prompt_filter) for chunk in chunks]
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_process_chunk, arg): idx for idx, arg in enumerate(chunk_args)}
-            for future in as_completed(futures):
-                try:
-                    exploded, _in_count, err_count = future.result()
-                    all_rows.extend(exploded)
-                    stats["errors"] += err_count
-                    stats["chunks_processed"] += 1
-                    if not quiet and stats["chunks_processed"] % 5 == 0:
-                        print(f"    Chunks completed: {stats['chunks_processed']}/{len(chunks)}")
-                except Exception as exc:
-                    stats["errors"] += 1
-                    if not quiet:
-                        print(f"    Chunk failed: {exc}", file=sys.stderr)
-    else:
-        for chunk in chunks:
-            exploded, _in_count, err_count = _process_chunk((chunk, prompt_filter))
-            all_rows.extend(exploded)
-            stats["errors"] += err_count
-            stats["chunks_processed"] += 1
-            if not quiet and stats["chunks_processed"] % 5 == 0:
-                print(f"    Chunks completed: {stats['chunks_processed']}/{len(chunks)}")
-
-    stats["output_rows"] = len(all_rows)
-
-    # ── Phase 3: Write output CSV with fixed header ──────────────────────
+    # Streamed explode-and-write: the output header is fixed (final_header),
+    # so exploded rows never need to be pooled for column discovery. Input is
+    # read in bounded chunks and each chunk's exploded rows are written to the
+    # output CSV as soon as the chunk completes, then released. Neither the full
+    # input nor the full exploded row set is held in memory; peak usage stays a
+    # small window of in-flight chunks regardless of input size or explosion ratio.
     if not quiet:
         print("Phase 3: Writing output CSV...")
 
-    # Write output using fixed M code-ordered header
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
-    with open(output_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=final_header, extrasaction="ignore", lineterminator="\n")
+    output_rows = 0
+    total_input = 0
+
+    def _read_chunks(reader):
+        current: list[dict] = []
+        for row in reader:
+            current.append(row)
+            if len(current) >= chunk_size:
+                yield current
+                current = []
+        if current:
+            yield current
+
+    with open(input_csv, "r", encoding="utf-8-sig", newline="") as f_in, \
+         open(output_csv, "w", encoding="utf-8", newline="") as f_out:
+        reader = csv.DictReader(f_in)
+        writer = csv.DictWriter(f_out, fieldnames=final_header, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
-        for row in all_rows:
-            writer.writerow(row)
+
+        use_parallel = workers > 1
+
+        if use_parallel:
+            with ProcessPoolExecutor(max_workers=workers, initializer=_deid_init_worker, initargs=(_DEIDENTIFY,)) as executor:
+                inflight: set = set()
+                max_inflight = max(1, workers * 2)
+                chunk_iter = _read_chunks(reader)
+                exhausted = False
+                while not exhausted or inflight:
+                    while not exhausted and len(inflight) < max_inflight:
+                        try:
+                            chunk = next(chunk_iter)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        total_input += len(chunk)
+                        inflight.add(executor.submit(_process_chunk, (chunk, prompt_filter)))
+                    if not inflight:
+                        break
+                    done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        try:
+                            exploded, _in_count, err_count = future.result()
+                            if exploded:
+                                writer.writerows(exploded)
+                                output_rows += len(exploded)
+                            stats["errors"] += err_count
+                            stats["chunks_processed"] += 1
+                            if not quiet and stats["chunks_processed"] % 5 == 0:
+                                print(f"    Chunks completed: {stats['chunks_processed']}")
+                        except Exception as exc:
+                            stats["errors"] += 1
+                            if not quiet:
+                                print(f"    Chunk failed: {exc}", file=sys.stderr)
+        else:
+            for chunk in _read_chunks(reader):
+                total_input += len(chunk)
+                exploded, _in_count, err_count = _process_chunk((chunk, prompt_filter))
+                if exploded:
+                    writer.writerows(exploded)
+                    output_rows += len(exploded)
+                stats["errors"] += err_count
+                stats["chunks_processed"] += 1
+                if not quiet and stats["chunks_processed"] % 5 == 0:
+                    print(f"    Chunks completed: {stats['chunks_processed']}")
+
+    stats["input_records"] = total_input
+    stats["output_rows"] = output_rows
+
+    if not quiet:
+        print(f"  Loaded {total_input:,} input records")
 
     t_elapsed = time.perf_counter() - t_start
 
@@ -1582,6 +1733,7 @@ def run_rollup(
     prompt_filter: str | None = None,
     quiet: bool = False,
     session_stats_csv: str | None = None,
+    deidentify: bool = False,
 ) -> dict[str, Any]:
     """
     Streaming rollup: read one or more CSVs row-by-row → parse AuditData → extract
@@ -1594,11 +1746,18 @@ def run_rollup(
 
     When `session_stats_csv` is provided, a parallel pass over CopilotEventData
     accumulates per-(UserId, CreationDate, AppHost) DISTINCTCOUNT(ThreadId) +
-    prompt/response counts and writes a 7-column SessionStats CSV. This matches
+    prompt/response counts and writes an 8-column SessionStats CSV. This matches
     the AI in One `Sessions` measure unit (one thread = one session).
 
     No exploded row dicts are ever stored in memory.
     """
+    # pax_fabric calls run_rollup() directly (in-process), bypassing the CLI
+    # main() that normally sets this module-level global from argparse. Mirror
+    # that wiring here so a programmatic call can opt into -Deidentify parity
+    # with the PS script.
+    global _DEIDENTIFY
+    _DEIDENTIFY = bool(deidentify)
+
     if isinstance(input_csv, (str, Path)):
         input_paths: list[str] = [str(input_csv)]
     else:
@@ -1700,7 +1859,7 @@ def run_rollup(
                         is_agent=is_agent,
                     )
 
-                # ── SessionStats accumulation (v2.6.0 — AI in One parity) ───
+                # ── SessionStats accumulation (AI in One parity) ───
                 # Only records with a CopilotEventData payload contribute. Threads
                 # without at least one user prompt are excluded (matches AI in One
                 # `Message_isPrompt = TRUE` filter).
@@ -1724,6 +1883,8 @@ def run_rollup(
                         sessions[skey] = sacc
                     sacc.prompt_count += prompts_here
                     sacc.response_count += responses_here
+                    if is_agent:
+                        sacc.agent_prompt_count += prompts_here  # exact chat/agent split
                     if thread_id and prompts_here > 0:
                         sacc.thread_ids.add(thread_id)
                         if is_agent:
@@ -1743,7 +1904,7 @@ def run_rollup(
         writer.writerow(ROLLUP_HEADER)
         for (uid_lower, cdate, op, wl, sfe, ah, agent_id, agent_name, ctx_type), acc in rollup.items():
             writer.writerow([
-                acc.original_user_id,  # output original casing, NOT lowered key
+                deid_upn(acc.original_user_id),  # output original casing, NOT lowered key
                 cdate,
                 op,
                 wl,
@@ -1759,7 +1920,7 @@ def run_rollup(
                 "TRUE" if acc.is_agent_interaction else "FALSE",
             ])
 
-    # ── SessionStats CSV (v2.6.0 — AI in One parity) ─────────────────────
+    # ── SessionStats CSV (AI in One parity) ─────────────────────
     if track_sessions:
         os.makedirs(os.path.dirname(os.path.abspath(session_stats_csv)), exist_ok=True)
         with open(session_stats_csv, "w", encoding="utf-8", newline="") as f:
@@ -1770,11 +1931,12 @@ def run_rollup(
                 if session_count == 0 and sacc.prompt_count == 0:
                     continue  # no signal — skip
                 writer.writerow([
-                    sacc.original_user_id,
+                    deid_upn(sacc.original_user_id),
                     cdate,
                     ah,
                     session_count,
                     sacc.prompt_count,
+                    sacc.agent_prompt_count,
                     sacc.response_count,
                     len(sacc.agent_thread_ids),
                 ])
@@ -1991,7 +2153,7 @@ def run_reconcile(
            _ru_count(Operation="CopilotInteraction", AppHost="Teams"),
            _ev_count(Operation="CopilotInteraction", AppHost="Teams"))
 
-    # Check 4: Excel FileAccessed (was FileViewed in pre-v2.3 — renamed via OP_RENAME)
+    # Check 4: Excel FileAccessed
     _check("Excel FileAccessed (Operation=FileAccessed, SourceFileExtension in xlsx/xls/xlsm/csv)",
            _ru_count(Operation="FileAccessed", SourceFileExtension={"xlsx", "xls", "xlsm", "csv"}),
            _ev_count(Operation="FileAccessed", SourceFileExtension={"xlsx", "xls", "xlsm", "csv"}))
@@ -2037,15 +2199,16 @@ def write_userstats_files(
       *_UserStats.csv     — one row per unique UserId with pre-computed metrics
       *_SessionCohort.csv — one row per (UserId, AppColumn) with session cohort label
 
-    When `session_stats_csv_path` is provided (v2.6.0+), the CECopilotPercentile_*
+    When `session_stats_csv_path` is provided, the CECopilotPercentile_*
     columns are computed from per-user PromptCount (human interactions) instead of
     raw audit-event counts. This matches the AI in One semantics and prevents
     service-principal / plugin-chain inflation from skewing the CE Quadrant.
 
     When `aggregated_rows` is provided (an iterable of dict[str,str]), it is used
     as the rollup source instead of reading from `aggregated_csv_path`. This allows
-    callers to stream rows from a Delta table without intermediate temp files.
-    Similarly, `session_stats_rows` replaces `session_stats_csv_path` when provided.
+    callers (pax_fabric's Delta-backed recompute) to stream rows from a Delta table
+    without intermediate temp files. Similarly, `session_stats_rows` replaces
+    `session_stats_csv_path` when provided.
 
     Returns (user_count, session_cohort_row_count).
     """
@@ -2079,7 +2242,7 @@ def write_userstats_files(
     o_ec: dict[str, int] = defaultdict(int)
     off_ec: dict[str, int] = defaultdict(int)
 
-    # ── v2.5.0: DAX-aligned per-user raw activity counts, computed per window.
+    # ── DAX-aligned per-user raw activity counts, computed per window.
     # Three windows (L30, L60, Full) feed both the LP <App> Weighted measures and the
     # CE percentile ranks. Each is a dict keyed by window code → {uid: count}.
     def _wbuckets() -> dict[str, dict[str, int]]:
@@ -2099,26 +2262,17 @@ def write_userstats_files(
     # normalize the engagement segmentation to active-days-per-week.
     all_dates: set[str] = set()
 
-    # ── v2.5.0: Pass 1 — determine the trailing-window cutoffs ──────────
+    # ── Pass 1 — determine the trailing-window cutoffs ──────────
     # Scan CreationDate only to find the most-recent date in the rollup. Cutoffs
     # are inclusive lower bounds; a row qualifies for window W iff date_key >= cutoff[W].
     # The "Full" window has no cutoff and always qualifies.
     _d_max_str = ""
-    _cached_rows: list[dict] | None = None  # cache for Delta source (can't re-read iterable)
-    if _use_delta_source:
-        _cached_rows = []
-        for _row in aggregated_rows:
-            _cached_rows.append(_row)
+    with open(agg_path, "r", encoding="utf-8-sig", newline="") as _f:
+        _r = csv.DictReader(_f)
+        for _row in _r:
             _dk = (_row.get("CreationDate", "") or "")[:10]
             if _dk and _dk > _d_max_str:
                 _d_max_str = _dk
-    else:
-        with open(agg_path, "r", encoding="utf-8-sig", newline="") as _f:
-            _r = csv.DictReader(_f)
-            for _row in _r:
-                _dk = (_row.get("CreationDate", "") or "")[:10]
-                if _dk and _dk > _d_max_str:
-                    _d_max_str = _dk
     if _d_max_str:
         try:
             _d_max = date.fromisoformat(_d_max_str)
@@ -2136,16 +2290,11 @@ def write_userstats_files(
         print(f"[UserStats] Window cutoffs: L30 >= {cutoff_l30 or '(all)'}, "
               f"L60 >= {cutoff_l60 or '(all)'}, max date = {_d_max_str or '(none)'}")
 
-    # ── Stream through aggregated data (CSV or cached Delta rows) ───────
+    # ── Stream through aggregated CSV ────────────────────────────────────
     row_count = 0
-    if _use_delta_source and _cached_rows is not None:
-        _row_iter = iter(_cached_rows)
-    else:
-        _csv_fh = open(agg_path, "r", encoding="utf-8-sig", newline="")
-        _row_iter = csv.DictReader(_csv_fh)
-
-    try:
-        for row in _row_iter:
+    with open(agg_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
             row_count += 1
 
             user_id = row.get("UserId", "")
@@ -2202,7 +2351,7 @@ def write_userstats_files(
             if ext in OFFICE_EXTS and op in FILE_OPS:
                 off_ec[uid_lower] += event_count
 
-            # ── v2.5.0: DAX-aligned raw counts, accumulated per window.
+            # ── DAX-aligned raw counts, accumulated per window.
             # Helper closure: write to Full always; to L60/L30 only if the row's
             # date_key satisfies the trailing-window cutoff.
             def _bump(buckets: dict[str, dict[str, int]], n: int) -> None:
@@ -2233,12 +2382,6 @@ def write_userstats_files(
             app = app_column(ext, op, wl)
             if app != "M365 All Apps":
                 session_ops[(uid_lower, app)].add(date_key)
-    finally:
-        if not _use_delta_source:
-            _csv_fh.close()
-    # Free cached rows to release memory before percentile computation
-    if _cached_rows is not None:
-        del _cached_rows
 
     if row_count == 0:
         if not quiet:
@@ -2298,7 +2441,7 @@ def write_userstats_files(
     cop_rank = compute_ranks({u: cop_ec.get(u, 0) for u in copilot_uids})
     m365_rank = compute_ranks({u: m365_ec.get(u, 0) for u in all_uids})
 
-    # ── v2.5.0: CE percentile ranks per window (integer 0–100, match DAX exactly) ──
+    # ── CE percentile ranks per window (integer 0–100, match DAX exactly) ──
     # DAX formula: ROUND( COUNTROWS(users with score <= mine) / COUNTROWS(users with score > 0) * 100 , 0)
     # Users with score 0 / no activity → BLANK (we emit empty string).
     def _ce_rank_pct(scores: dict[str, int]) -> dict[str, str]:
@@ -2333,36 +2476,14 @@ def write_userstats_files(
     ce_rank_ppt     = {w: _ce_rank_pct({u: ppt_raw[w].get(u, 0)     for u in all_uids}) for w in RANK_WINDOWS}
     ce_rank_all     = {w: _ce_rank_pct(m365_all_apps_raw[w])                              for w in RANK_WINDOWS}
 
-    # ── v2.6.0: CE Copilot Percentile based on PROMPT COUNT (human interactions) ──
+    # ── CE Copilot Percentile based on PROMPT COUNT (human interactions) ──
     # Read the SessionStats CSV (if produced by run_rollup) and tally PromptCount per
     # user per window. This is the AI in One semantics: one count per `isPrompt=TRUE`
     # message — resistant to AI-response fanout, plugin chains, retries, and most
     # service-principal noise. Falls back to audit-event tally if SessionStats is
     # missing (older script invocations).
     prompt_raw = _wbuckets()
-    _use_delta_ss = session_stats_rows is not None
-    if _use_delta_ss:
-        for _row in session_stats_rows:
-            _uid = (_row.get("UserId") or "").strip().lower()
-            if not _uid:
-                continue
-            _date_key = (_row.get("CreationDate") or "")[:10]
-            try:
-                _pc = int(_row.get("PromptCount") or 0)
-            except ValueError:
-                _pc = 0
-            if _pc <= 0:
-                continue
-            prompt_raw["Full"][_uid] += _pc
-            if cutoff_l60 and _date_key >= cutoff_l60:
-                prompt_raw["L60"][_uid] += _pc
-            if cutoff_l30 and _date_key >= cutoff_l30:
-                prompt_raw["L30"][_uid] += _pc
-        if not quiet:
-            _tot = sum(prompt_raw["Full"].values())
-            print(f"[UserStats] CE Copilot Percentile source: PromptCount "
-                  f"({_tot:,} prompts across {len(prompt_raw['Full']):,} users)")
-    elif session_stats_csv_path:
+    if session_stats_csv_path:
         _ss = Path(session_stats_csv_path)
         if _ss.is_file():
             with open(_ss, "r", encoding="utf-8-sig", newline="") as _f:
@@ -2457,7 +2578,7 @@ def write_userstats_files(
                 t_act, o_act, off_act,
                 t_seg, o_seg, w_seg, x_seg, p_seg,
                 off_seg, overall_seg,
-                # v2.5.0: precomputed raw + CE rank columns per window (order must
+                # Precomputed raw + CE rank columns per window (order must
                 # match USERSTATS_HEADER: 6 raws × 3 windows, then 7 ranks × 3 windows)
                 teams_raw["L30"].get(uid, 0),   teams_raw["L60"].get(uid, 0),   teams_raw["Full"].get(uid, 0),
                 outlook_raw["L30"].get(uid, 0), outlook_raw["L60"].get(uid, 0), outlook_raw["Full"].get(uid, 0),
@@ -2552,7 +2673,7 @@ EXAMPLES
         --outlook Outlook_Export.csv ^
         --files   Files_Export.csv ^
         --copilot Copilot_Export.csv ^
-        --output-dir .\output
+        --output-dir ./output
 
 
 OUTPUT (rollup mode, both layouts produce the same three files):
@@ -2666,6 +2787,16 @@ ADVANCED
         help=argparse.SUPPRESS,
     )
     advanced.add_argument(
+        "--deidentify",
+        action="store_true",
+        default=False,
+        help=(
+            "One-way hash all identifying values (UserId, mailbox UPN/GUID/SIDs, "
+            "device name, resource URLs/file names) for anonymous reporting. "
+            "Deterministic and format-preserving; irreversible (no decode map)."
+        ),
+    )
+    advanced.add_argument(
         "--rebuild-sidecars-from-rollup",
         metavar="ROLLUP_CSV",
         default=None,
@@ -2693,6 +2824,9 @@ ADVANCED
     )
 
     args = parser.parse_args()
+
+    global _DEIDENTIFY
+    _DEIDENTIFY = bool(args.deidentify)
 
     # ── Standalone sidecar regeneration mode ─────────────────────────────
     # When --rebuild-sidecars-from-rollup is supplied, ignore every other

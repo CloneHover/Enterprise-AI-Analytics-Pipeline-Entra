@@ -1,24 +1,48 @@
 #!/usr/bin/env python3
 """
-Purview CopilotInteraction Processor v3.1.0
+Purview CopilotInteraction Processor v4.2.1
 -------------------------------------------
 Two-input / two-output preprocessor for the AI Business Value Dashboard
-and AI-in-One Rollup PBIPs.
+(ValueLens / AIBV) and AI-in-One (AIO) Rollup PBIPs.
+
+PAX_FABRIC PORT NOTES (read before assuming byte-parity with the PowerShell
+embedded processor at this version number):
+    PORTED:     Dual output profile (--profile aio|aibv), profile-aware
+                classification (Environment / Behavior_Category /
+                Behavior_Enriched / Autonomy_Pattern / Behavior_Source /
+                Value_Outcome), the AIBV-only offloaded calc columns
+                (Behavior_Enriched_Full, Usage_Mode, Expertise_Role,
+                Efficiency_Breakdown, Human_Baseline_Min, Behavior_Plausible,
+                Workflow_Action, Delegation_Event_Key, Agent Publish Status,
+                Is_Agent_Activity, Web_Grounded_Signal), the full
+                --deidentify engine (deid_upn/name/guid/sid/token/resource/
+                file/proxy), the always-on org/manager-hierarchy Users-dim
+                columns with a working --hierarchy-fill / --hierarchy-fill-label
+                effect (built from the manager_id / manager_userPrincipalName
+                / id / displayName columns already present in the Entra
+                export), and --with-aggregates pre-aggregated summary tables.
+    NOT PORTED (deferred — accepted as a scope trade-off given the size of
+                this port): the 3-file --licensing input mode, SQLite-backed
+                row streaming for very large Entra directories, and AIO
+                canonical-header aliasing.
 
 Inputs:
     --purview <raw Purview audit log CSV>     (required)
     --entra   <Entra users CSV w/ licensing>  (required)
 
 Outputs (in --out-dir, default = directory of --purview):
-    <purview_stem>_Interactions_<YYYYMMDD_HHMMSS>.csv   (fact table)
-    <entra_stem>_Users_<YYYYMMDD_HHMMSS>.csv            (dim table)
+    <purview_stem>_Interactions.csv   (fact table)
+    <entra_stem>_Users.csv            (dim table)
 
 Grain:
-    One row per (16-column grain x Message_Id). DAX measures use
+    One row per (grain x Message_Id). DAX measures use
     DISTINCTCOUNT(Message_Id) which yields exact parity with the
     semantic-model definitions at every visual / slicer combination.
     Per-resource accumulation is intentionally avoided so counts are
     not inflated (~2.25x) by per (prompt x AccessedResource) iteration.
+    The AIO grain is 16 columns; the AIBV grain promotes 3 additional
+    per-resource flags (Is_Agent_Activity, Web_Grounded_Signal,
+    Workflow_Action) for slicer fidelity — see schema_for().
 
 INT-surrogated columns (perf):
     Message_Id, ThreadId, and UserKey (replaces Audit_UserId) are emitted
@@ -30,18 +54,6 @@ INT-surrogated columns (perf):
     are identical between INT and string surrogates of the same set.
     UserMonthKey stays string (cross-processor blast radius).
 
-Calc cols ported from DAX -> precomputed here for ingestion-time speedup:
-    Agent_TitleID, Behavior_Source, Value_Outcome, ActivityDate
-    (= InteractionDate alias).
-
-Stays in DAX (cross-table dependencies that cannot be precomputed without
-shipping Agents 365 / UserMonthMetrics / AgentMetrics into the processor):
-    Behavior_Enriched_Full (RELATED Agents 365),
-    User_Stage_Maturity / User_Stage (RELATED UserMonthMetrics),
-    Usage_Mode, Expertise_Role, Efficiency_Breakdown
-    (all depend on Behavior_Enriched_Full),
-    Agent Last Used Date (LOOKUPVALUE AgentMetrics).
-
 Requirements:
     Python 3.9+
     pip install orjson   (OPTIONAL - faster JSON parsing; falls back to stdlib json)
@@ -52,6 +64,8 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import hashlib
+import hmac
 import os
 import re
 import sys
@@ -88,18 +102,25 @@ except ImportError:
     _JSON_ENGINE = "json (stdlib)"
 
 
-SCRIPT_VERSION = "3.1.0"
+SCRIPT_VERSION = "4.2.1"
 
 # ---------------------------------------------------------------------------
-# Output schemas
+# Output schemas — TWO PROFILES
+#
+#   --profile aio   : the original AI-in-One dashboard output (5-value
+#                     Environment vocabulary). Unchanged from v3.1.0 except
+#                     for the trailing Message_Id_Raw / ThreadId_Raw /
+#                     User_Id_Normalized reconciliation columns.
+#   --profile aibv  : the ValueLens (AI Business Value) superset (3-value
+#                     Environment, all offloaded calc cols + grain-promoted
+#                     sliceable flags).
+#
+# Both share one classification CODEBASE; the per-profile vocabulary is
+# selected by the `profile` argument threaded through the classifiers.
 # ---------------------------------------------------------------------------
 
-# Grain keys used for rollup groupby. Mirrors the slicer/filter dimensions
-# that any AIO or AIBV BEFORE PBIP visual binds to. AccessedResource_*,
-# CreationDate, Resource_Count, etc. are NOT in the grain because they are
-# either per-resource (would fan rows back out and break parity) or
-# derivable / per-prompt-only.
-GRAIN_KEYS: tuple[str, ...] = (
+# Common grain prefix (identical in both profiles).
+_GRAIN_KEYS_COMMON: tuple[str, ...] = (
     "UserKey",
     "InteractionDate",
     "AgentId",
@@ -118,14 +139,29 @@ GRAIN_KEYS: tuple[str, ...] = (
     "ThreadId",
 )
 
-# Per-(grain x Message_Id) attributes carried through to the output row.
-# Some are constant per Message_Id (CreationDate, Has license, Agent_TitleID,
-# WeekStart/MonthStart/UserMonthKey, AppIdentity_DisplayName, ModelName,
-# AISystemPlugin_Id, Audit_UserId_Normalized); a few may vary across the
-# resources collapsed into one row (SensitivityLabelId, AccessedResource_*)
-# for which last-resource-wins is the deterministic choice — same semantic
-# as the prior dict-overwrite behavior.
-_NONGRAIN_ATTRS: tuple[str, ...] = (
+# AIO grain = the common 16.
+GRAIN_KEYS_AIO: tuple[str, ...] = _GRAIN_KEYS_COMMON
+
+# AIBV grain = common 16 + 3 promoted per-resource flags (sliceability fix).
+GRAIN_KEYS_AIBV: tuple[str, ...] = _GRAIN_KEYS_COMMON + (
+    "Is_Agent_Activity",
+    "Web_Grounded_Signal",
+    "Workflow_Action",
+)
+
+# Cross-run append reconciliation keys: the stable raw GUIDs behind the
+# INT surrogates Message_Id (message) and ThreadId (thread). Appended as the
+# FINAL two columns of EVERY profile. Under --deidentify these carry the
+# deterministic deid_guid token (same raw GUID -> same token across runs) so
+# append dedup still reconciles.
+_RAW_ID_ATTRS: tuple[str, ...] = (
+    "Message_Id_Raw",
+    "ThreadId_Raw",
+)
+
+# AIO non-grain carried attrs end at ActivityDate; the trailing
+# _RAW_ID_ATTRS are appended below to form _NONGRAIN_ATTRS_AIO.
+_NONGRAIN_ATTRS_AIO_BASE: tuple[str, ...] = (
     "CreationDate",
     "WeekStart",
     "MonthStart",
@@ -142,19 +178,43 @@ _NONGRAIN_ATTRS: tuple[str, ...] = (
     "ModelTransparencyDetails_ModelName",
     "Agent_TitleID",
     "Message_isPrompt",
-    # Calc cols ported from DAX
     "Behavior_Source",
     "Value_Outcome",
     "ActivityDate",
-    # Raw audit GUIDs preserved for cross-run merge (seed mid_to_int / thread_key_map).
-    # Always emitted; PBIT model ignores these columns at refresh time.
-    "Message_Id_Raw",
-    "ThreadId_Raw",
 )
+# AIO carried attrs = the base set + a stable deid-consistent user-identity
+# column + the trailing raw reconciliation keys.
+_NONGRAIN_ATTRS_AIO: tuple[str, ...] = _NONGRAIN_ATTRS_AIO_BASE + (
+    "User_Id_Normalized",
+) + _RAW_ID_ATTRS
 
-# Final fact CSV schema. One row per (grain x Message_Id). Message_Id is
+# AIBV non-grain carried attrs = AIO base set + AIBV-only offloaded columns,
+# with the raw reconciliation keys appended LAST.
+_NONGRAIN_ATTRS_AIBV: tuple[str, ...] = _NONGRAIN_ATTRS_AIO_BASE + (
+    "Audit_UserId",
+    "Audit_UserId_Normalized",
+    "Agent Filter",
+    "Agent Publish Status",
+    "Behavior_Enriched_Full",
+    "Usage_Mode",
+    "Expertise_Role",
+    "Efficiency_Breakdown",
+    "Human_Baseline_Min",
+    "Behavior_Plausible",
+    "Delegation_Event_Key",
+) + _RAW_ID_ATTRS
+
+# Final fact CSV schemas. One row per (grain x Message_Id). Message_Id is
 # emitted as a sequential INT surrogate (1-based, assigned in input order).
-FACT_HEADER: list[str] = list(GRAIN_KEYS) + ["Message_Id"] + list(_NONGRAIN_ATTRS)
+FACT_HEADER_AIO: list[str] = list(GRAIN_KEYS_AIO) + ["Message_Id"] + list(_NONGRAIN_ATTRS_AIO)
+FACT_HEADER_AIBV: list[str] = list(GRAIN_KEYS_AIBV) + ["Message_Id"] + list(_NONGRAIN_ATTRS_AIBV)
+
+
+def schema_for(profile: str) -> tuple[tuple[str, ...], tuple[str, ...], list[str]]:
+    """Return (grain_keys, nongrain_attrs, fact_header) for the profile."""
+    if profile == "aio":
+        return GRAIN_KEYS_AIO, _NONGRAIN_ATTRS_AIO, FACT_HEADER_AIO
+    return GRAIN_KEYS_AIBV, _NONGRAIN_ATTRS_AIBV, FACT_HEADER_AIBV
 
 # Entra column-name aliases used by the existing PBIP M-code. We mirror the
 # same renaming so the dim CSV is drop-in compatible with all downstream DAX.
@@ -173,6 +233,245 @@ HAS_LICENSE_VARIANTS = (
     "Has Copilot license assigned",
     "isUser",
 )
+
+# ---------------------------------------------------------------------------
+# Deidentification (--deidentify): one-way, salted, format-preserving.
+# OFF by default; enabled by main() setting the module flag from --deidentify.
+# Every PII value becomes a deterministic token so relationships (manager
+# links, UserKey/Users joins, distinct-resource counts) are preserved while
+# identities are removed. Irreversible (no decode map). The SAME salt +
+# algorithm + formats exist verbatim in the PowerShell raw-path deidentifier
+# and the M365 processor (PAX deidentify spec) so tokens match across engines.
+# ---------------------------------------------------------------------------
+_DEIDENTIFY: bool = False
+_DEID_SALT = b"PAX-Deidentify-Salt-v1-DO-NOT-CHANGE-7f3c1e9b2d846050a1c4e8b3"
+_DEID_DOMAIN = "deidentified.domain"
+_deid_cache: dict[str, str] = {}
+
+
+def _deid_hex(value: str, length: int) -> str:
+    return hmac.new(
+        _DEID_SALT, value.strip().lower().encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:length]
+
+
+def deid_upn(value: str) -> str:
+    """UPN / email -> <12hex>@deidentified.domain. No-op when off or value empty."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "upn\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12) + "@" + _DEID_DOMAIN
+        _deid_cache[k] = v
+    return v
+
+
+def deid_name(value: str) -> str:
+    """Person/device display name -> <12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "name\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_guid(value: str) -> str:
+    """GUID -> deterministic GUID shape xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "guid\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        h = _deid_hex(value, 32)
+        v = f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+        _deid_cache[k] = v
+    return v
+
+
+def deid_sid(value: str) -> str:
+    """SID -> deterministic S-1-5-21-<d1>-<d2>-<d3>-<d4> shape."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "sid\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        h = _deid_hex(value, 32)
+        v = "S-1-5-21-{0}-{1}-{2}-{3}".format(
+            int(h[0:8], 16), int(h[8:16], 16), int(h[16:24], 16), int(h[24:32], 16)
+        )
+        _deid_cache[k] = v
+    return v
+
+
+def deid_token(value: str) -> str:
+    """Opaque id (employeeId, immutableId) -> <12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "tok\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_resource(value: str) -> str:
+    """Resource URL -> site_<12hex> (whole-string hash; preserves distinct-count)."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "res\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = "site_" + _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_file(value: str) -> str:
+    """File / document name -> file_<12hex>."""
+    if not _DEIDENTIFY or not value:
+        return value
+    k = "file\x00" + value
+    v = _deid_cache.get(k)
+    if v is None:
+        v = "file_" + _deid_hex(value, 12)
+        _deid_cache[k] = v
+    return v
+
+
+def deid_proxy(value: str) -> str:
+    """proxyAddresses entry(ies) -> keep smtp:/SMTP: prefix + deidentified email.
+    Handles ';'-delimited multi-value fields."""
+    if not _DEIDENTIFY or not value:
+        return value
+    out = []
+    for entry in value.split(";"):
+        if not entry:
+            out.append(entry)
+        elif ":" in entry:
+            prefix, addr = entry.split(":", 1)
+            out.append(prefix + ":" + deid_upn(addr))
+        else:
+            out.append(deid_upn(entry))
+    return ";".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Org/manager hierarchy (v1.11.15 parity): --hierarchy-fill / --hierarchy-fill-label.
+# Always-on Users-dim columns (Manager_UserKey, OrgLevel, HierarchyPath,
+# TopOfChain_UserKey, IsManager, DirectReports, TotalReports, Level0..Level{N}
+# _UserKey/_Name) built from the manager_id / manager_userPrincipalName chain
+# already present in the Entra export. --hierarchy-fill controls ONLY what
+# appears in level slots DEEPER than a user's own level (the hierarchy columns
+# themselves are always emitted regardless of this setting).
+# ---------------------------------------------------------------------------
+_HIER_LEVELS = 15           # Level0..Level14 denormalized top-down columns
+_HIER_WALK_CAP = 1000       # safety backstop for manager-chain walks (cycle guard also applies)
+
+_HIER_FILL_MODE = "none"    # none | self | manager | fixed (set from --hierarchy-fill)
+_HIER_FILL_LABEL = ""       # literal label for 'fixed' (set from --hierarchy-fill-label)
+
+
+def _hier_columns() -> list[str]:
+    cols = [
+        "Manager_UserKey", "OrgLevel", "HierarchyPath", "TopOfChain_UserKey",
+        "IsManager", "DirectReports", "TotalReports",
+    ]
+    for i in range(_HIER_LEVELS):
+        cols.append(f"Level{i}_UserKey")
+        cols.append(f"Level{i}_Name")
+    return cols
+
+
+_HIER_COLUMNS: list[str] = _hier_columns()
+
+
+def _hier_filler(uk: int, mgr, name_by_uk: dict, mode: str, label: str) -> tuple[str, str]:
+    """(UserKey, Name) to place in a level slot DEEPER than the user's own level."""
+    if mode == "self":
+        return str(uk), name_by_uk.get(uk, "")
+    if mode == "manager":
+        ref = mgr if mgr is not None else uk
+        return str(ref), name_by_uk.get(ref, "")
+    if mode == "fixed":
+        return "", label
+    return "", ""  # none
+
+
+def _build_org_hierarchy(uk_by_id, uk_by_upn, mgr_ptr, name_by_uk) -> dict:
+    """Return {UserKey -> {hier_col: value}}.
+
+    uk_by_id  : normalized Entra id   -> UserKey
+    uk_by_upn : normalized UPN        -> UserKey
+    mgr_ptr   : UserKey -> (manager_id_norm, manager_upn_norm)
+    name_by_uk: UserKey -> display name (as written; deid'd when applicable)
+    """
+    # Immediate manager UserKey for each user (id link first, UPN fallback).
+    direct_mgr: dict = {}
+    for uk, (mid, mupn) in mgr_ptr.items():
+        m = uk_by_id.get(mid) if mid else None
+        if m is None and mupn:
+            m = uk_by_upn.get(mupn)
+        if m == uk:
+            m = None  # ignore self-management
+        direct_mgr[uk] = m
+
+    direct_reports: dict = {}
+    for uk, m in direct_mgr.items():
+        if m is not None:
+            direct_reports[m] = direct_reports.get(m, 0) + 1
+
+    all_uks = set(uk_by_upn.values()) | set(name_by_uk.keys()) | set(direct_mgr.keys())
+    total_reports: dict = {}
+    result: dict = {}
+    mode = _HIER_FILL_MODE
+    label = _HIER_FILL_LABEL
+
+    for uk in all_uks:
+        chain = []
+        seen = set()
+        cur = uk
+        while cur is not None and cur not in seen and len(chain) < _HIER_WALK_CAP:
+            seen.add(cur)
+            chain.append(cur)
+            cur = direct_mgr.get(cur)
+        # every ancestor of uk gains one report (cycle-safe via `seen`)
+        for anc in chain[1:]:
+            total_reports[anc] = total_reports.get(anc, 0) + 1
+        chain.reverse()  # top .. user
+        depth = len(chain) - 1
+        top = chain[0]
+        mgr = direct_mgr.get(uk)
+        rec = {
+            "Manager_UserKey": str(mgr) if mgr is not None else "",
+            "OrgLevel": str(depth),
+            "HierarchyPath": "/".join(str(x) for x in chain),
+            "TopOfChain_UserKey": str(top),
+        }
+        n = len(chain)
+        for i in range(_HIER_LEVELS):
+            if i < n:
+                node = chain[i]
+                rec[f"Level{i}_UserKey"] = str(node)
+                rec[f"Level{i}_Name"] = name_by_uk.get(node, "")
+            else:
+                fk, fn = _hier_filler(uk, mgr, name_by_uk, mode, label)
+                rec[f"Level{i}_UserKey"] = fk
+                rec[f"Level{i}_Name"] = fn
+        result[uk] = rec
+
+    for uk in all_uks:
+        dr = direct_reports.get(uk, 0)
+        result[uk]["DirectReports"] = str(dr)
+        result[uk]["IsManager"] = "TRUE" if dr > 0 else "FALSE"
+        result[uk]["TotalReports"] = str(total_reports.get(uk, 0))
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Datetime helpers
@@ -362,29 +661,14 @@ def resource_rows(ced: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def is_copilot_interaction(audit_data: dict[str, Any], raw_row: dict[str, Any]) -> bool:
-    # Case-insensitive comparison AND a RecordType fallback. The canonical
-    # Microsoft Purview schema spells the value 'CopilotInteraction' with that
-    # exact casing in the AuditData JSON, but real-world exports occasionally
-    # arrive with mixed casing ("copilotinteraction"), extra whitespace, or
-    # with Operation only populated on RecordType=261 rows. Treat any of those
-    # signals as a positive match — being strict here was producing false
-    # 'Skipped (non-Copilot)' counts on perfectly valid CopilotInteraction rows.
+    # v4.2.1 parity: exact match on Operation only (upstream dropped the
+    # RecordType=261 fallback that v3.1.0 had).
     operation = to_text(
         safe_get(audit_data, "Operation")
         or raw_row.get("Operation")
         or raw_row.get("Operations")
     ).strip()
-    if operation.lower() == "copilotinteraction":
-        return True
-    record_type = to_text(
-        safe_get(audit_data, "RecordType")
-        or raw_row.get("RecordType")
-    ).strip()
-    # RecordType 261 == CopilotInteraction in the M365 audit schema. The value
-    # may arrive as an int, a numeric string, or the symbolic name.
-    if record_type == "261" or record_type.lower() == "copilotinteraction":
-        return True
-    return False
+    return operation == "CopilotInteraction"
 
 
 # ---------------------------------------------------------------------------
@@ -417,19 +701,29 @@ def compute_license_status(has_license_raw: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def compute_environment(has_license_raw: str, agent_name: str, agent_id: str, app_host: str) -> str:
-    host = (app_host or "").lower()
-    has_agent = bool((agent_name or "").strip()) or bool((agent_id or "").strip())
+def compute_environment(profile: str, has_license_raw: str, agent_name: str, agent_id: str, app_host: str) -> str:
     license_val = (has_license_raw or "").strip().upper()
-    if host in {"autonomous", "logic app"}:
-        return "Autonomous Agent"
-    if "cowork" in host:
+    if profile == "aio":
+        # AIO vocabulary (5-value, keyed off app_host + agent presence).
+        host = (app_host or "").lower()
+        has_agent = bool((agent_name or "").strip()) or bool((agent_id or "").strip())
+        if host in {"autonomous", "logic app"}:
+            return "Autonomous Agent"
+        if "cowork" in host:
+            return "Cowork"
+        if has_agent:
+            return "Agents"
+        if license_val in _LICENSE_TRUTHY:
+            return "Licensed M365 Copilot"
+        return "Unlicensed Chat"
+    # AIBV vocabulary (verbatim port of current AIBV calc col `Environment`):
+    #   IF(CONTAINSSTRING(LOWER(TRIM(AgentName)),"cowork"),"Cowork",
+    #   IF(isLicensed,"Licensed","Unlicensed"))
+    if "cowork" in (agent_name or "").strip().lower():
         return "Cowork"
-    if has_agent:
-        return "Agents"
     if license_val in _LICENSE_TRUTHY:
-        return "Licensed M365 Copilot"
-    return "Unlicensed Chat"
+        return "Licensed"
+    return "Unlicensed"
 
 
 @functools.lru_cache(maxsize=None)
@@ -468,7 +762,7 @@ def compute_ai_model(model_name: str) -> str:
 
 
 def _resource_behavior(
-    res_type: str, res_action: str, site_url: str, is_active: bool
+    profile: str, res_type: str, res_action: str, site_url: str, is_active: bool
 ) -> str:
     if res_action in {"sendemailv2", "draftemail", "senddraftemail", "updatedraftemail"}:
         return "Email Drafting"
@@ -482,8 +776,16 @@ def _resource_behavior(
         return "Teams Messaging"
     if res_type in {"teamsmessage", "teamschat", "teamschannel"}:
         return "Teams Messaging"
-    if res_type in {"flow", "connector", "http"}:
-        return "Workflow Execution"
+    if profile == "aio":
+        # Any flow/connector/http resource -> "Workflow Execution".
+        if res_type in {"flow", "connector", "http"}:
+            return "Workflow Execution"
+    else:
+        # AIBV: explicit Flow always; connector/http only with an active verb.
+        if res_type == "flow":
+            return "Running a Workflow"
+        if res_type in {"connector", "http"} and is_active:
+            return "Running a Workflow"
     if res_action in {"executedatasetquery", "getitems", "getalltables", "gettableviews"}:
         return "Data Querying"
     if res_type in {"xlsx", "csv", "xlsm", "xlsb", "xls"}:
@@ -541,7 +843,7 @@ def _resource_behavior(
     return ""
 
 
-def _context_behavior(app_host: str, ctx_type: str, is_active: bool) -> str:
+def _context_behavior(profile: str, app_host: str, ctx_type: str, is_active: bool, has_agent: bool) -> str:
     if ctx_type == "teamsmeeting":
         return "Meeting Prep"
     if ctx_type == "streamvideo":
@@ -580,8 +882,16 @@ def _context_behavior(app_host: str, ctx_type: str, is_active: bool) -> str:
         return "Real-time Collaboration"
     if app_host == "copilot studio":
         return "Domain-Specific Agent"
-    if app_host in {"autonomous", "logic app"}:
-        return "Workflow Execution"
+    if profile == "aio":
+        # Autonomous OR logic app -> "Workflow Execution".
+        if app_host in {"autonomous", "logic app"}:
+            return "Workflow Execution"
+    else:
+        # AIBV: autonomous always; logic app only when an agent context is present.
+        if app_host == "autonomous":
+            return "Running a Workflow"
+        if app_host == "logic app" and has_agent:
+            return "Running a Workflow"
     if app_host in {"datawarehousing core", "power bi"}:
         return "Data Querying"
     return "General Chat"
@@ -589,12 +899,14 @@ def _context_behavior(app_host: str, ctx_type: str, is_active: bool) -> str:
 
 @functools.lru_cache(maxsize=None)
 def compute_behavior_category(
+    profile: str,
     app_host: str,
     ctx_type: str,
     res_type: str,
     res_action: str,
     site_url: str,
     plugin_id: str,
+    has_agent: bool,
 ) -> str:
     app_host_l = (app_host or "").lower()
     ctx_l = (ctx_type or "").lower()
@@ -604,12 +916,12 @@ def compute_behavior_category(
     plugin_l = (plugin_id or "").lower()
     is_active = any(tok in res_a_l for tok in _ACTIVE_RES_ACTION_TOKENS)
 
-    from_resource = _resource_behavior(res_t_l, res_a_l, site_l, is_active)
+    from_resource = _resource_behavior(profile, res_t_l, res_a_l, site_l, is_active)
     if from_resource:
         return from_resource
     if plugin_l == "enterprisesearch":
         return "Enterprise Searching"
-    return _context_behavior(app_host_l, ctx_l, is_active)
+    return _context_behavior(profile, app_host_l, ctx_l, is_active, has_agent)
 
 
 _GENERIC_QA_BEHAVIORS = {"General Q&A", "M365 Chat Q&A", "Teams Q&A", "Browser Q&A", "General Chat"}
@@ -628,8 +940,10 @@ _AGENT_NAME_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
 
 
 @functools.lru_cache(maxsize=None)
-def compute_behavior_enriched(behavior_category: str, agent_name: str, environment: str) -> str:
-    if environment not in {"Agents", "Autonomous Agent"}:
+def compute_behavior_enriched(profile: str, behavior_category: str, agent_name: str, environment: str) -> str:
+    # AIO enriches agent/autonomous rows; AIBV enriches agents/cowork rows.
+    enrich_envs = {"Agents", "Autonomous Agent"} if profile == "aio" else {"Agents", "Cowork"}
+    if environment not in enrich_envs:
         return behavior_category
     if behavior_category not in _GENERIC_QA_BEHAVIORS:
         return behavior_category
@@ -640,20 +954,32 @@ def compute_behavior_enriched(behavior_category: str, agent_name: str, environme
     return "Agent: General Purpose"
 
 
+# Autonomy_Pattern — profile-aware.
+#   AIO: keyed off the 5-value Environment.
+#   AIBV: SWITCH(Cowork->3, Is_Agent_Activity->2, Licensed->1, else BLANK).
 @functools.lru_cache(maxsize=None)
-def compute_autonomy_pattern(environment: str) -> str:
-    if environment == "Licensed M365 Copilot":
-        return "1 - Copilot"
-    if environment == "Agents":
+def compute_autonomy_pattern(profile: str, environment: str, is_agent_activity_str: str) -> str:
+    if profile == "aio":
+        if environment == "Licensed M365 Copilot":
+            return "1 - Copilot"
+        if environment == "Agents":
+            return "2 - Agent-Assisted"
+        if environment == "Autonomous Agent":
+            return "3 - Autonomous"
+        return ""
+    if environment == "Cowork":
+        return "3 - Cowork"
+    if is_agent_activity_str == "TRUE":
         return "2 - Agent-Assisted"
-    if environment == "Autonomous Agent":
-        return "3 - Autonomous"
+    if environment == "Licensed":
+        return "1 - Copilot"
     return ""
 
 
-# Verbatim port of AIBV BEFORE DAX calc col `Behavior_Source`.
+# Behavior_Source — profile-aware (AIO: "Autonomous Agent" branch; AIBV: "Cowork").
 @functools.lru_cache(maxsize=None)
 def compute_behavior_source(
+    profile: str,
     behavior_category: str,
     environment: str,
     agent_name: str,
@@ -663,8 +989,10 @@ def compute_behavior_source(
     agent = (agent_name or "").strip()
     plugin = (plugin_name or "").strip()
     app = (app_host or "").strip()
-    if environment == "Autonomous Agent":
+    if profile == "aio" and environment == "Autonomous Agent":
         source = "Autonomous Agent" + (f": {agent}" if agent else "")
+    elif profile != "aio" and environment == "Cowork":
+        source = "Cowork" + (f": {agent}" if agent else "")
     elif environment == "Agents" and agent:
         source = f"Agent: {agent}"
     elif plugin:
@@ -676,7 +1004,7 @@ def compute_behavior_source(
     return f"{behavior_category} → {source}"
 
 
-# Verbatim port of AIBV BEFORE DAX calc col `Value_Outcome`.
+# Verbatim port of current AIBV DAX calc col `Value_Outcome`.
 _VO_TIME_EMAIL = frozenset({"Email Summarising", "Email Triage", "Email Thread Summary"})
 _VO_TIME_MEET = frozenset({"Meeting Prep", "Video Summarising"})
 _VO_TIME_DOC = frozenset({"Document Summarising", "Presentation Summarising", "Note Taking"})
@@ -700,9 +1028,11 @@ _VO_DOMAIN = frozenset({"Domain-Specific Agent", "Cross-Org Agent"})
 
 @functools.lru_cache(maxsize=None)
 def compute_value_outcome(
-    behavior_enriched: str, environment: str, is_sensitive_str: str
+    profile: str, behavior_enriched: str, environment: str, is_sensitive_str: str
 ) -> str:
     b = behavior_enriched or ""
+    workflow_behavior = "Workflow Execution" if profile == "aio" else "Running a Workflow"
+    workflow_env = "Autonomous Agent" if profile == "aio" else "Cowork"
     if b in _VO_TIME_EMAIL:
         return "Time Saved (Email)"
     if b in _VO_TIME_MEET:
@@ -719,14 +1049,14 @@ def compute_value_outcome(
         return "Content Output"
     if b in _VO_TEAMCOLLAB:
         return "Team Collaboration"
-    if b == "Workflow Execution" or environment == "Autonomous Agent":
+    if b == workflow_behavior or environment == workflow_env:
         return "Workflow Automation"
     if b == "Task Management":
         return "Task Coordination"
     if (
         is_sensitive_str == "TRUE"
         and environment != "Agents"
-        and environment != "Autonomous Agent"
+        and environment != workflow_env
     ):
         return "Compliance & Risk"
     if b in _VO_DATA:
@@ -748,11 +1078,321 @@ def compute_value_outcome(
     return "General AI Productivity"
 
 
+# ---------------------------------------------------------------------------
+# Downstream classification chain (offloaded from AIBV DAX; AIBV profile only).
+# Per F2: in the current AIBV model `Environment` never returns "Agents", so
+# `Behavior_Enriched_Full` collapses to exactly `Behavior_Enriched` (the
+# RELATED('Agents 365'...) NeedsEnhancement guard is always FALSE), making the
+# whole chain computable here without ingesting Agents 365.
+# ---------------------------------------------------------------------------
+
+
+def compute_behavior_enriched_full(behavior_enriched: str) -> str:
+    return behavior_enriched
+
+
+_UM_PRODUCING = frozenset({
+    "Email Drafting", "Document Drafting", "Presentation Creation", "Image Generation",
+    "Code Writing", "Code Analysis", "Code Analysis (URL)", "Data Querying",
+    "Spreadsheet Analysis", "Excel Assistance", "Agent: Content Generation",
+    "Agent: Ideation & Creative", "Agent: Research & Analysis", "Agent: Data & Reporting",
+    "Agent: Sales & Customer", "Agent: HR & People", "Agent: IT & Service Desk",
+    "Agent: Compliance & Policy", "Agent: Coaching", "Agent: Coaching (URL)",
+    "Domain-Specific Agent", "Cross-Org Agent", "Form / Survey Work",
+    "Real-time Collaboration", "Note Taking", "Teams Messaging", "Meeting Scheduling",
+    "Task Management",
+})
+_UM_CONSUMING = frozenset({
+    "Document Summarising", "Email Summarising", "Email Thread Summary", "Email Triage",
+    "Presentation Summarising", "Video Summarising", "Meeting Prep",
+    "Image / Media Analysis", "Image/Media Analysis", "Sensitive Content Interaction",
+})
+_UM_FINDING = frozenset({
+    "Web Searching", "Enterprise Searching", "PDF Analysis", "SharePoint Access",
+    "File Retrieval", "People Lookup", "Agent: Knowledge Base", "Spreadsheet Review",
+})
+
+
+@functools.lru_cache(maxsize=None)
+def compute_usage_mode(behavior_enriched_full: str, environment: str, app_host: str) -> str:
+    behavior = behavior_enriched_full
+    host = (app_host or "").lower()
+    is_delegating = (
+        environment == "Cowork"
+        or host == "autonomous"
+        or behavior == "Running a Workflow"
+    )
+    if is_delegating:
+        return "5 - Delegating"
+    if behavior in _UM_PRODUCING:
+        return "4 - Producing"
+    if behavior in _UM_CONSUMING:
+        return "3 - Consuming"
+    if behavior in _UM_FINDING:
+        return "2 - Finding"
+    return "1 - Asking"
+
+
+_EXPERTISE_RULES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"Data Querying", "Agent: Data & Reporting", "Spreadsheet Analysis"}), "Data Analyst"),
+    (frozenset({"Code Writing", "Code Analysis", "Code Analysis (URL)"}), "Software Engineer"),
+    (frozenset({"Agent: Research & Analysis"}), "Business Analyst"),
+    (frozenset({"Agent: Compliance & Policy", "Sensitive Content Interaction"}), "Compliance Specialist"),
+    (frozenset({"Agent: Sales & Customer"}), "Sales Consultant"),
+    (frozenset({"Agent: IT & Service Desk"}), "IT Specialist"),
+    (frozenset({"Agent: HR & People"}), "HR Specialist"),
+    (frozenset({"Agent: Coaching", "Agent: Coaching (URL)"}), "Coach"),
+    (frozenset({"Running a Workflow", "Task Management"}), "Automation Engineer"),
+    (frozenset({"Domain-Specific Agent", "Cross-Org Agent"}), "Domain Expert"),
+    (frozenset({"Email Drafting"}), "Communications Specialist"),
+    (frozenset({"Email Triage", "Meeting Scheduling", "Email Summarising", "Email Thread Summary"}), "Executive Assistant"),
+    (frozenset({"Document Drafting", "Agent: Content Generation", "Note Taking", "Document Summarising"}), "Content Writer"),
+    (frozenset({"Presentation Creation", "Presentation Summarising"}), "Presentation Designer"),
+    (frozenset({"Image Generation", "Image/Media Analysis", "Image / Media Analysis", "Agent: Ideation & Creative"}), "Visual Designer"),
+    (frozenset({"Meeting Prep", "Video Summarising"}), "Meeting Coordinator"),
+    (frozenset({"Web Searching", "PDF Analysis", "Agent: Knowledge Base"}), "Researcher"),
+    (frozenset({"Enterprise Searching", "SharePoint Access", "File Retrieval", "People Lookup"}), "Knowledge Navigator"),
+    (frozenset({"Spreadsheet Review", "Excel Assistance"}), "Spreadsheet Specialist"),
+    (frozenset({"Real-time Collaboration", "Form / Survey Work", "Form/Survey Work", "Teams Messaging"}), "Collaboration Lead"),
+)
+
+
+@functools.lru_cache(maxsize=None)
+def compute_expertise_role(behavior_enriched_full: str) -> str:
+    for members, label in _EXPERTISE_RULES:
+        if behavior_enriched_full in members:
+            return label
+    return ""
+
+
+_EFF_RULES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"Email Summarising", "Email Triage", "Email Thread Summary", "Email Drafting"}), "Email"),
+    (frozenset({"Document Summarising", "Note Taking", "Document Drafting", "Agent: Content Generation"}), "Document Assistance"),
+    (frozenset({"Presentation Summarising", "Presentation Creation"}), "Presentations"),
+    (frozenset({"Meeting Prep", "Video Summarising", "Meeting Scheduling"}), "Meetings"),
+    (frozenset({"Web Searching", "Enterprise Searching", "PDF Analysis", "SharePoint Access", "File Retrieval", "People Lookup", "Agent: Knowledge Base", "Agent: Research & Analysis"}), "Search & Research"),
+    (frozenset({"Spreadsheet Review", "Excel Assistance", "Spreadsheet Analysis", "Data Querying", "Agent: Data & Reporting"}), "Data & Spreadsheets"),
+    (frozenset({"Image Generation", "Image / Media Analysis", "Image/Media Analysis", "Agent: Ideation & Creative", "Code Writing", "Code Analysis", "Code Analysis (URL)"}), "Creative & Technical"),
+    (frozenset({"Teams Messaging", "Real-time Collaboration", "Form / Survey Work", "Task Management", "Running a Workflow"}), "Collaboration & Workflows"),
+    (frozenset({"Agent: Sales & Customer", "Agent: IT & Service Desk", "Agent: HR & People", "Agent: Compliance & Policy", "Agent: Coaching", "Agent: Coaching (URL)", "Domain-Specific Agent", "Cross-Org Agent"}), "Specialist Agents"),
+)
+
+
+@functools.lru_cache(maxsize=None)
+def compute_efficiency_breakdown(behavior_enriched_full: str, behavior_category: str) -> str:
+    for members, label in _EFF_RULES:
+        if behavior_enriched_full in members:
+            return label
+    if behavior_category == "Teams Q&A":
+        return "Teams Chat"
+    if behavior_category == "M365 Chat Q&A":
+        return "BizChat Q&A"
+    if behavior_category == "Browser Q&A":
+        return "BizChat Q&A"
+    return "General Q&A"
+
+
+# Static ROI baseline lookup (Behavior -> Human Baseline minutes), transcribed
+# verbatim from the AIBV `.pbit` static #table literals so the fact-row
+# pre-join collapses the SUMX+RELATED ROI measure to a plain SUM.
+_HUMAN_BASELINE_MIN: dict[str, int] = {
+    "Agent: Coaching": 45,
+    "Agent: Coaching (URL)": 25,
+    "Agent: Compliance & Policy": 25,
+    "Agent: Content Generation": 25,
+    "Agent: Data & Reporting": 35,
+    "Agent: General Purpose": 15,
+    "Agent: HR & People": 35,
+    "Agent: IT & Service Desk": 20,
+    "Agent: Ideation & Creative": 40,
+    "Agent: Knowledge Base": 12,
+    "Agent: Research & Analysis": 45,
+    "Agent: Sales & Customer": 35,
+    "Browser Q&A": 10,
+    "Code Analysis": 30,
+    "Code Analysis (URL)": 15,
+    "Code Writing": 45,
+    "Cross-Org Agent": 30,
+    "Data Querying": 30,
+    "Document Drafting": 60,
+    "Document Summarising": 20,
+    "Domain-Specific Agent": 25,
+    "Email Drafting": 8,
+    "Email Summarising": 4,
+    "Email Thread Summary": 5,
+    "Email Triage": 10,
+    "Enterprise Searching": 18,
+    "Excel Assistance": 30,
+    "File Retrieval": 15,
+    "Form / Survey Work": 25,
+    "Form/Survey Work": 25,
+    "General Chat": 10,
+    "General Q&A": 10,
+    "Image / Media Analysis": 8,
+    "Image Generation": 60,
+    "Image/Media Analysis": 8,
+    "M365 Chat Q&A": 10,
+    "Meeting Prep": 15,
+    "Meeting Scheduling": 12,
+    "Note Taking": 20,
+    "PDF Analysis": 35,
+    "People Lookup": 10,
+    "Presentation Creation": 90,
+    "Presentation Summarising": 12,
+    "Real-time Collaboration": 30,
+    "Running a Workflow": 15,
+    "Sensitive Content Interaction": 20,
+    "SharePoint Access": 12,
+    "Spreadsheet Analysis": 40,
+    "Spreadsheet Review": 25,
+    "Task Management": 20,
+    "Teams Messaging": 8,
+    "Teams Q&A": 10,
+    "Video Summarising": 30,
+    "Web Searching": 22,
+}
+
+_BVM_BEHAVIORS: frozenset = frozenset({
+    "Agent: Coaching", "Agent: Compliance & Policy", "Agent: Content Generation",
+    "Agent: Data & Reporting", "Agent: General Purpose", "Agent: HR & People",
+    "Agent: IT & Service Desk", "Agent: Ideation & Creative", "Agent: Knowledge Base",
+    "Agent: Research & Analysis", "Agent: Sales & Customer", "Code Analysis",
+    "Code Writing", "Data Querying", "Document Drafting", "Document Summarising",
+    "Domain-Specific Agent", "Email Drafting", "Email Summarising",
+    "Enterprise Searching", "Excel Assistance", "File Retrieval",
+    "Form / Survey Work", "General Chat", "Image / Media Analysis",
+    "Image Generation", "Meeting Prep", "Meeting Scheduling", "Note Taking",
+    "PDF Analysis", "People Lookup", "Presentation Creation",
+    "Presentation Summarising", "Real-time Collaboration", "Running a Workflow",
+    "SharePoint Access", "Spreadsheet Review", "Task Management",
+    "Teams Messaging", "Video Summarising", "Web Searching",
+})
+
+
+@functools.lru_cache(maxsize=None)
+def compute_human_baseline_min(behavior_enriched_full: str) -> str:
+    if behavior_enriched_full in _BVM_BEHAVIORS:
+        return str(_HUMAN_BASELINE_MIN[behavior_enriched_full])
+    return ""
+
+
+_UNLICENSED_PLAUSIBLE = frozenset({
+    "General Chat", "Web Searching", "PDF Analysis", "Document Summarising",
+    "Image / Media Analysis", "Image Generation", "Code Analysis", "Translation",
+})
+_BP_WORKAROUND_EMAIL = frozenset({"Email Summarising", "Email Drafting"})
+_BP_WORKAROUND_SHEET = frozenset({"Excel Assistance", "Spreadsheet Review", "Data Querying"})
+_BP_WORKAROUND_MEET = frozenset({"Meeting Prep", "Meeting Scheduling"})
+_BP_WORKAROUND_ENT = frozenset({"Enterprise Searching", "People Lookup"})
+_BP_WORKAROUND_WORKFLOW = frozenset({"Running a Workflow", "Task Management"})
+
+
+@functools.lru_cache(maxsize=None)
+def compute_behavior_plausible(license_status: str, behavior_category: str) -> str:
+    lic = license_status
+    beh = behavior_category
+    if lic == "M365 Copilot Licensed" or beh in _UNLICENSED_PLAUSIBLE:
+        return beh
+    if beh in _BP_WORKAROUND_EMAIL:
+        return "Free Chat Workaround (pasting Email)"
+    if beh in _BP_WORKAROUND_SHEET:
+        return "Free Chat Workaround (pasting Spreadsheet/Data)"
+    if beh in _BP_WORKAROUND_MEET:
+        return "Free Chat Workaround (pasting Meeting info)"
+    if beh == "Teams Messaging":
+        return "Free Chat Workaround (pasting Teams content)"
+    if beh in _BP_WORKAROUND_ENT:
+        return "Free Chat Workaround (pasting Enterprise data)"
+    if beh in _BP_WORKAROUND_WORKFLOW:
+        return "Free Chat Workaround (pasting Workflow)"
+    if beh == "Real-time Collaboration":
+        return "Free Chat Workaround (pasting Loop content)"
+    if beh == "Code Writing":
+        return "Free Chat Workaround (pasting Code)"
+    if beh == "Video Summarising":
+        return "Free Chat Workaround (uploading Video)"
+    return "Free Chat Workaround (Other)"
+
+
+@functools.lru_cache(maxsize=None)
+def compute_workflow_action(behavior_enriched_full: str, res_action: str, app_host: str) -> str:
+    if behavior_enriched_full != "Running a Workflow":
+        return ""
+    ra = (res_action or "").lower()
+    host = (app_host or "").lower()
+    if "send" in ra or "post" in ra or "notify" in ra:
+        return "Sending / Notifying"
+    if "create" in ra or "draft" in ra or "write" in ra or "add" in ra:
+        return "Creating Content"
+    if "invoke" in ra or "execute" in ra or "trigger" in ra or "run" in ra:
+        return "Invoking / Triggering"
+    if "update" in ra or "patch" in ra or "modify" in ra or "set" in ra:
+        return "Updating Records"
+    if "read" in ra or "get" in ra or "list" in ra or "fetch" in ra:
+        return "Reading Data"
+    if "delete" in ra or "remove" in ra:
+        return "Deleting / Removing"
+    if host == "autonomous":
+        return "Autonomous Run (no action logged)"
+    if host == "logic app":
+        return "Logic App Run (no action logged)"
+    return "Workflow (other)"
+
+
+def compute_delegation_event_key(
+    audit_user_id: str,
+    interaction_date_str: str,
+    agent_name: str,
+    workflow_action: str,
+    app_host: str,
+) -> str:
+    tail = "unknown-workflow"
+    for candidate in (agent_name, workflow_action, app_host):
+        if candidate and candidate.strip():
+            tail = candidate
+            break
+    return f"{audit_user_id}|{interaction_date_str}|{tail}"
+
+
 def compute_user_month_key(audit_user_id: str, month_start_str: str) -> str:
     if not audit_user_id or not month_start_str:
         return ""
     # MonthStart is YYYY-MM-DD; format key as YYYY-MM (mirrors DAX FORMAT(...,"yyyy-MM"))
     return f"{audit_user_id}|{month_start_str[:7]}"
+
+
+@functools.lru_cache(maxsize=None)
+def compute_agent_publish_status(agent_id: str, agent_name: str) -> str:
+    has_agent_id = bool((agent_id or "").strip())
+    if not has_agent_id:
+        return "Not an Agent Row"
+    if "draft as 1p" in (agent_name or "").lower():
+        return "Unpublished"
+    return "Published"
+
+
+@functools.lru_cache(maxsize=None)
+def compute_is_agent_activity(agent_name: str, agent_id: str, app_host: str, res_type: str) -> str:
+    has_agent = bool((agent_name or "").strip())
+    has_agent_id = bool((agent_id or "").strip())
+    host = (app_host or "").lower()
+    rt = (res_type or "").lower()
+    is_autonomous = host in {"autonomous", "logic app"} or rt in {"flow", "connector"}
+    return "TRUE" if (has_agent or has_agent_id or is_autonomous) else "FALSE"
+
+
+@functools.lru_cache(maxsize=None)
+def compute_web_grounded_signal(res_type: str, site_url: str) -> str:
+    rt = (res_type or "").lower()
+    su = (site_url or "").lower()
+    is_internal = "sharepoint.com" in su or ".onmicrosoft.com" in su
+    if (
+        rt == "websearchquery"
+        or rt in {"external", "http"}
+        or (rt == "http://schema.skype.com/hyperlink" and not is_internal)
+    ):
+        return "Web Grounded"
+    return "Not Web Grounded"
 
 
 # ---------------------------------------------------------------------------
@@ -790,12 +1430,13 @@ def load_entra_and_write_users(
     users_out_csv: str,
     user_key_map: dict[str, int],
     quiet: bool = False,
+    profile: str = "aibv",
 ) -> dict[str, dict[str, str]]:
     """
     Read the Entra CSV, write the Users dim CSV (with PBIP-compatible renames +
-    precomputed License Status + UserKey INT surrogate), and return a dict
-    keyed on PersonId_Normalized -> {"Has license": ..., "License Status": ...}
-    for fact-row lookup.
+    precomputed License Status + UserKey INT surrogate + org/manager hierarchy
+    columns), and return a dict keyed on PersonId_Normalized ->
+    {"Has license": ..., "License Status": ...} for fact-row lookup.
 
     Mutates `user_key_map` (normalized_upn -> int) in place — every Entra row
     with a non-empty PersonId_Normalized is assigned a UserKey (1-based, in
@@ -810,6 +1451,17 @@ def load_entra_and_write_users(
       adds PersonId_Normalized (lower+trim of PersonId)
       adds License Status (precomputed)
       adds TotalEmployees (row count, repeated per row)
+      adds org/manager hierarchy columns (always emitted; see _HIER_COLUMNS) —
+      built from the manager_id / manager_userPrincipalName / id / displayName
+      columns already present in the Entra export. --hierarchy-fill controls
+      only the filler for level slots deeper than a user's own level.
+
+    NOTE (pax_fabric port scope): ``profile`` is accepted for call-site parity
+    with the v4.2.1 dual-profile processor but is NOT yet used to select a
+    3-file licensing input or AIO canonical header aliasing — those remain
+    deferred (see module docstring). Deidentification of Entra identity
+    columns is likewise deferred here; only the fact-row values produced by
+    explode_record are deidentified in this port.
     """
     with open(entra_csv, "r", encoding="utf-8-sig", newline="") as fin:
         # Sniff via a generous quote-aware reader; encoding="utf-8-sig" eats BOM if present.
@@ -851,11 +1503,47 @@ def load_entra_and_write_users(
         for inj in injected:
             if inj not in renamed_headers:
                 renamed_headers.append(inj)
+        # Org/manager hierarchy columns (always appended; AIO/AIBV Users dim).
+        for hc in _HIER_COLUMNS:
+            if hc not in renamed_headers:
+                renamed_headers.append(hc)
 
         rows = list(reader)
 
     total_rows = len(rows)
     user_lookup: dict[str, dict[str, str]] = {}
+
+    # --- Org/manager hierarchy pre-pass: assign UserKeys in Entra-file order
+    # and build the link maps from the SAME source columns the write loop
+    # reads, then resolve the hierarchy. Always on for the Users dim. UserKeys
+    # assigned here are reused by the write loop (identical to the prior lazy
+    # assignment). ---
+    uk_by_id: dict[str, int] = {}
+    uk_by_upn: dict[str, int] = {}
+    mgr_ptr: dict[int, tuple[str, str]] = {}
+    name_by_uk: dict[int, str] = {}
+    for src_row in rows:
+        pid = src_row.get(upn_col, "") if (upn_col and upn_col != "PersonId") else src_row.get("PersonId", "")
+        pid = "" if pid is None else str(pid)
+        pid_norm = pid.strip().lower()
+        if not pid_norm:
+            continue
+        uk = mint_user_key(user_key_map, pid_norm)
+        uk_by_upn[pid_norm] = uk
+        rid = src_row.get("id", "")
+        rid = "" if rid is None else str(rid)
+        rid_norm = rid.strip().lower()
+        if rid_norm:
+            uk_by_id[rid_norm] = uk
+        mid = src_row.get("manager_id", "")
+        mid = "" if mid is None else str(mid)
+        mupn = src_row.get("manager_userPrincipalName", "")
+        mupn = "" if mupn is None else str(mupn)
+        mgr_ptr[uk] = (mid.strip().lower(), mupn.strip().lower())
+        dn = src_row.get("displayName", "")
+        dn = "" if dn is None else str(dn)
+        name_by_uk[uk] = dn
+    hier_by_uk = _build_org_hierarchy(uk_by_id, uk_by_upn, mgr_ptr, name_by_uk)
 
     out_dir = Path(users_out_csv).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -884,10 +1572,7 @@ def load_entra_and_write_users(
 
             # UserKey (INT surrogate; assigned in Entra-file order)
             if person_id_norm:
-                user_key = user_key_map.get(person_id_norm)
-                if user_key is None:
-                    user_key = len(user_key_map) + 1
-                    user_key_map[person_id_norm] = user_key
+                user_key = mint_user_key(user_key_map, person_id_norm)
                 out_row["UserKey"] = str(user_key)
             else:
                 out_row["UserKey"] = ""
@@ -909,6 +1594,14 @@ def load_entra_and_write_users(
 
             # TotalEmployees (matches M-code: row count repeated per row)
             out_row["TotalEmployees"] = str(total_rows)
+
+            # Org/manager hierarchy columns (always emitted; blank if no UserKey).
+            uk_str = out_row.get("UserKey", "")
+            if uk_str:
+                hrec = hier_by_uk.get(int(uk_str))
+                if hrec:
+                    for hc in _HIER_COLUMNS:
+                        out_row[hc] = hrec.get(hc, "")
 
             writer.writerow(out_row)
 
@@ -940,16 +1633,25 @@ def load_entra_and_write_users(
 # ---------------------------------------------------------------------------
 
 
+def mint_user_key(user_key_map: dict[str, int], normalized_key: str) -> int:
+    """Return the existing UserKey INT for ``normalized_key``, or mint a new
+    one (1-based, in first-encounter order) and store it in ``user_key_map``."""
+    key = user_key_map.get(normalized_key)
+    if key is None:
+        key = len(user_key_map) + 1
+        user_key_map[normalized_key] = key
+    return key
+
+
 def explode_record(
     audit_data: dict[str, Any],
     user_lookup: dict[str, dict[str, str]],
     user_key_map: dict[str, int],
     thread_key_map: dict[str, int],
-) -> list[dict[str, Any]]:
+    profile: str,
+) -> list[tuple[tuple[str, ...], str, dict[str, Any], bool, str]]:
     creation_time_raw = audit_data.get("CreationTime")
     creation_time_raw_str = to_text(creation_time_raw).strip()
-    # Cached bundle: 4 derived date strings in one shot, keyed on the raw
-    # timestamp string (~K distinct values across N records).
     creation_date_str, interaction_date_str, week_start_str, month_start_str = (
         _date_strings_for_raw(creation_time_raw_str)
     )
@@ -975,19 +1677,21 @@ def explode_record(
     audit_user_id_raw = to_text(audit_data.get("UserId"))
     if not _is_human_upn(audit_user_id_raw):
         return []
+    # Deidentify (no-op unless --deidentify) AFTER the human-UPN filter so the
+    # filter sees the original; every downstream UserKey/Audit_UserId/join
+    # derives from the hashed value, keeping it consistent with the (also
+    # hashed) Users dim.
+    audit_user_id_raw = deid_upn(audit_user_id_raw)
     audit_user_id_norm = normalize_user_id(audit_user_id_raw)
-    # UserKey INT surrogate. If this audit user wasn't in Entra, mint a new
-    # INT and stash so subsequent rows for the same user reuse it. The
-    # caller tracks unmatched-vs-Entra via the lookup membership check.
     if audit_user_id_norm:
-        user_key = user_key_map.get(audit_user_id_norm)
-        if user_key is None:
-            user_key = len(user_key_map) + 1
-            user_key_map[audit_user_id_norm] = user_key
+        user_key = mint_user_key(user_key_map, audit_user_id_norm)
     else:
         user_key = ""
-    # ThreadId INT surrogate.
-    thread_id_raw = to_text(ced.get("ThreadId"))
+    # ThreadId INT surrogate. deid_guid is a no-op unless --deidentify; under
+    # --deidentify it returns a deterministic, format-preserving token so the
+    # INT-surrogate keying, the ThreadId_Raw output column, and cross-run
+    # append dedup stay consistent.
+    thread_id_raw = deid_guid(to_text(ced.get("ThreadId")))
     if thread_id_raw:
         thread_key = thread_key_map.get(thread_id_raw)
         if thread_key is None:
@@ -1005,25 +1709,20 @@ def explode_record(
     user_rec = user_lookup.get(audit_user_id_norm) or {}
     has_license_raw = user_rec.get("Has license", "")
     license_status = user_rec.get("License Status") or compute_license_status(has_license_raw)
-    environment = compute_environment(has_license_raw, agent_name, agent_id, app_host_str)
-    autonomy_pattern = compute_autonomy_pattern(environment)
+    environment = compute_environment(profile, has_license_raw, agent_name, agent_id, app_host_str)
     ai_model = compute_ai_model(model_name_str)
     user_month_key = compute_user_month_key(audit_user_id_raw, month_start_str)
 
-    # Per-record constants hoisted out of the (prompt x resource) inner loop.
-    # All grain values are pre-stringified via to_text() exactly once so the
-    # rollup loop can use the tuple directly as the dict key.
+    is_aibv = profile != "aio"
+
     user_key_text = to_text(user_key)
     thread_key_text = to_text(thread_key)
     agent_title_id = derive_agent_title_id(agent_id)
     aisystem_plugin_name_str = to_text(first_plugin.get("Name")) if first_plugin else ""
     in_entra = (audit_user_id_norm in user_lookup) if audit_user_id_norm else True
+    agent_publish_status = compute_agent_publish_status(agent_id, agent_name) if is_aibv else ""
+    has_agent_ctx = bool(agent_name.strip()) or bool(agent_id.strip())
 
-    # Stable portion of the nongrain dict (everything that does NOT depend on
-    # the per-resource fields). Built once per record; copied per emitted
-    # row and updated with the resource-varying keys. Values mirror the
-    # prior base_row exactly (same types, same to_text() handling) so the
-    # final flushed CSV bytes are identical.
     base_nongrain: dict[str, Any] = {
         "CreationDate": creation_date_str,
         "WeekStart": week_start_str,
@@ -1032,7 +1731,6 @@ def explode_record(
         "Has license": has_license_raw,
         "Resource_Count": resource_count_value,
         "SensitivityLabelId": sens_label_str,
-        # AccessedResource_* injected per-resource below.
         "AccessedResource_Type": "",
         "AccessedResource_Action": "",
         "AccessedResource_SiteUrl": "",
@@ -1042,44 +1740,68 @@ def explode_record(
         "ModelTransparencyDetails_ModelName": model_name_str,
         "Agent_TitleID": agent_title_id,
         "Message_isPrompt": "TRUE",
-        # Behavior_Source / Value_Outcome injected per-resource below.
         "Behavior_Source": "",
         "Value_Outcome": "",
         "ActivityDate": interaction_date_str,
-        # ThreadId_Raw is constant per record; Message_Id_Raw injected per-message below.
-        "Message_Id_Raw": "",
+        # Stable, deid-consistent user identity — carried on the AIO profile
+        # only (AIBV's header carries Audit_UserId_Normalized instead; this
+        # key is a harmless extra ignored by the AIBV fact-header selection).
+        "User_Id_Normalized": audit_user_id_norm,
         "ThreadId_Raw": thread_id_raw,
     }
+    if is_aibv:
+        base_nongrain.update({
+            "Audit_UserId": audit_user_id_raw,
+            "Audit_UserId_Normalized": audit_user_id_norm,
+            "Agent Filter": "",
+            "Agent Publish Status": agent_publish_status,
+            "Behavior_Enriched_Full": "",
+            "Usage_Mode": "",
+            "Expertise_Role": "",
+            "Efficiency_Breakdown": "",
+            "Human_Baseline_Min": "",
+            "Behavior_Plausible": "",
+            "Delegation_Event_Key": "",
+        })
 
-    # Output schema: list of tuples
-    #   (grain_tuple, message_id_str, nongrain_dict, in_entra, audit_user_id_norm)
-    # consumed directly by run_processor's rollup loop (no per-row dict
-    # rebuild, no transient _audit_user_* keys).
     rows: list[tuple[tuple[str, ...], str, dict[str, Any], bool, str]] = []
     for message in prompts:
-        message_id = to_text(message.get("Id"))
+        # deid_guid is a no-op unless --deidentify (then deterministic +
+        # format-preserving), so message_id doubles as the raw Message_Id_Raw
+        # dedup key AND the stable mid_to_int surrogate key that aligns with
+        # --seed-mid-map across runs.
+        message_id = deid_guid(to_text(message.get("Id")))
         for resource in resources:
             res_type_str = to_text(resource.get("Type"))
             res_action_str = to_text(resource.get("Action"))
             res_site_str = to_text(resource.get("SiteUrl"))
             res_sens_label_str = to_text(resource.get("SensitivityLabelId"))
             behavior_category = compute_behavior_category(
-                app_host_str, ctx_type_str, res_type_str, res_action_str, res_site_str, plugin_id_str
+                profile, app_host_str, ctx_type_str, res_type_str, res_action_str,
+                res_site_str, plugin_id_str, has_agent_ctx,
             )
-            behavior_enriched = compute_behavior_enriched(behavior_category, agent_name, environment)
+            behavior_enriched = compute_behavior_enriched(
+                profile, behavior_category, agent_name, environment
+            )
             is_sensitive_str = compute_is_sensitive(sens_label_str, res_sens_label_str)
             behavior_source = compute_behavior_source(
-                behavior_category, environment, agent_name,
+                profile, behavior_category, environment, agent_name,
                 aisystem_plugin_name_str, app_host_str,
             )
             value_outcome = compute_value_outcome(
-                behavior_enriched, environment, is_sensitive_str,
+                profile, behavior_enriched, environment, is_sensitive_str,
             )
 
-            # Grain tuple in EXACT GRAIN_KEYS order (verified at module load
-            # via _assert_grain_order below). All values are already
-            # pre-stringified.
-            grain_tuple = (
+            nongrain = dict(base_nongrain)
+            nongrain["Message_Id_Raw"] = message_id
+            nongrain["AccessedResource_Type"] = res_type_str
+            nongrain["AccessedResource_Action"] = res_action_str
+            nongrain["AccessedResource_SiteUrl"] = deid_resource(res_site_str)
+            nongrain["AccessedResource_SensitivityLabelId"] = res_sens_label_str
+            nongrain["Behavior_Source"] = behavior_source
+            nongrain["Value_Outcome"] = value_outcome
+
+            common_grain = (
                 user_key_text,
                 interaction_date_str,
                 agent_id,
@@ -1092,24 +1814,287 @@ def explode_record(
                 behavior_enriched,
                 ai_model,
                 is_sensitive_str,
-                autonomy_pattern,
-                app_identity_app_id,
-                aisystem_plugin_name_str,
-                thread_key_text,
             )
 
-            nongrain = dict(base_nongrain)
-            nongrain["AccessedResource_Type"] = res_type_str
-            nongrain["AccessedResource_Action"] = res_action_str
-            nongrain["AccessedResource_SiteUrl"] = res_site_str
-            nongrain["AccessedResource_SensitivityLabelId"] = res_sens_label_str
-            nongrain["Behavior_Source"] = behavior_source
-            nongrain["Value_Outcome"] = value_outcome
-            nongrain["Message_Id_Raw"] = message_id
+            if is_aibv:
+                is_agent_activity_str = compute_is_agent_activity(
+                    agent_name, agent_id, app_host_str, res_type_str
+                )
+                web_grounded_str = compute_web_grounded_signal(res_type_str, res_site_str)
+                autonomy_pattern = compute_autonomy_pattern(profile, environment, is_agent_activity_str)
+                behavior_enriched_full = compute_behavior_enriched_full(behavior_enriched)
+                usage_mode = compute_usage_mode(behavior_enriched_full, environment, app_host_str)
+                expertise_role = compute_expertise_role(behavior_enriched_full)
+                efficiency_breakdown = compute_efficiency_breakdown(behavior_enriched_full, behavior_category)
+                human_baseline_min = compute_human_baseline_min(behavior_enriched_full)
+                behavior_plausible = compute_behavior_plausible(license_status, behavior_category)
+                workflow_action = compute_workflow_action(behavior_enriched_full, res_action_str, app_host_str)
+                delegation_event_key = compute_delegation_event_key(
+                    audit_user_id_raw, interaction_date_str, agent_name, workflow_action, app_host_str,
+                )
+                grain_tuple = common_grain + (
+                    autonomy_pattern,
+                    app_identity_app_id,
+                    aisystem_plugin_name_str,
+                    thread_key_text,
+                    is_agent_activity_str,
+                    web_grounded_str,
+                    workflow_action,
+                )
+                nongrain["Agent Filter"] = "Agents" if is_agent_activity_str == "TRUE" else ""
+                nongrain["Behavior_Enriched_Full"] = behavior_enriched_full
+                nongrain["Usage_Mode"] = usage_mode
+                nongrain["Expertise_Role"] = expertise_role
+                nongrain["Efficiency_Breakdown"] = efficiency_breakdown
+                nongrain["Human_Baseline_Min"] = human_baseline_min
+                nongrain["Behavior_Plausible"] = behavior_plausible
+                nongrain["Delegation_Event_Key"] = delegation_event_key
+            else:
+                autonomy_pattern = compute_autonomy_pattern(profile, environment, "")
+                grain_tuple = common_grain + (
+                    autonomy_pattern,
+                    app_identity_app_id,
+                    aisystem_plugin_name_str,
+                    thread_key_text,
+                )
 
             rows.append((grain_tuple, message_id, nongrain, in_entra, audit_user_id_norm))
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Pre-aggregated tables (AIBV profile only, opt-in via --with-aggregates).
+# Offloads the DAX calculated tables (ActiveDaysSummary / UserMonthMetrics /
+# rankings / summary) that otherwise SUMMARIZE the whole fact on refresh.
+# ---------------------------------------------------------------------------
+
+_VALUEFOCUS_MODES = frozenset({"4 - Producing", "5 - Delegating"})
+
+
+def _percentile_inc(sorted_vals: list[float], p: float) -> float:
+    """PERCENTILE.INC / PERCENTILEX.INC — linear interpolation, p in [0, 1]."""
+    n = len(sorted_vals)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_vals[0]
+    rank = p * (n - 1)
+    lo = int(rank)
+    if lo + 1 >= n:
+        return sorted_vals[lo]
+    frac = rank - lo
+    return sorted_vals[lo] + (sorted_vals[lo + 1] - sorted_vals[lo]) * frac
+
+
+def _usage_rank(avg_ppw: float, p90: float, p75: float, p50: float, p25: float) -> str:
+    if avg_ppw == 0:
+        return "0. No Usage"
+    if avg_ppw >= p90:
+        return "5. Top 10% Users"
+    if avg_ppw >= p75:
+        return "4. 75-90% Users"
+    if avg_ppw >= p50:
+        return "3. 50-75% Users"
+    if avg_ppw >= p25:
+        return "2. 25-50% Users"
+    return "1. Bottom 25% Users"
+
+
+def _user_stage(active_days: int, behavior_count: int, value_focus_share: float, has_agent: bool) -> str:
+    if active_days >= 15 or (active_days >= 10 and value_focus_share >= 0.30 and has_agent):
+        return "4 - Power"
+    if active_days >= 8 and behavior_count >= 5:
+        return "3 - Habitual"
+    if active_days >= 3 and behavior_count >= 3:
+        return "2 - Developing"
+    return "1 - Beginner"
+
+
+def _activity_segment(avg_days: float) -> str:
+    if avg_days == 0:
+        return "0. No Activity"
+    if avg_days <= 5:
+        return "1. 1-5 Chat Days/Month - 'Infrequent'"
+    if avg_days <= 10:
+        return "2. 6-10 Chat Days/Month - 'Moderate'"
+    if avg_days <= 19:
+        return "3. 11-19 Chat Days/Month - 'Frequent'"
+    return "4. 20+ Chat Days/Month - 'Daily'"
+
+
+def _fmt_float(x: float) -> str:
+    """Shortest round-trippable float, integers without trailing '.0'."""
+    if x == int(x):
+        return str(int(x))
+    return repr(x)
+
+
+def compute_and_write_aggregates(
+    rollup: dict[tuple[Any, ...], dict[str, Any]],
+    agg_paths: dict[str, str],
+    quiet: bool = False,
+) -> dict[str, int]:
+    """Build the 5 AIBV pre-aggregated tables from the rollup and write them.
+
+    Returns {table_name: row_count}. `agg_paths` keys:
+      active_days, user_month_metrics, licensed_rankings,
+      unlicensed_rankings, licensed_summary.
+    """
+    um: dict[tuple[str, str], dict[str, Any]] = {}
+    ua: dict[str, dict[str, Any]] = {}
+
+    for grain_key, nongrain in rollup.items():
+        gk = grain_key[0]  # rollup key is ((grain_tuple), mid_int)
+        mid = grain_key[1]
+        interaction_date = gk[1]
+        agent_name = gk[3]
+        license_status = gk[6]
+        uid = nongrain["Audit_UserId"]
+        month = nongrain["MonthStart"]
+        week = nongrain["WeekStart"]
+        bef = nongrain["Behavior_Enriched_Full"]
+        usage_mode = nongrain["Usage_Mode"]
+
+        mk = (uid, month)
+        a = um.get(mk)
+        if a is None:
+            a = um[mk] = {
+                "idates": set(), "mids": set(), "behaviors": set(),
+                "has_agent": False, "rows": 0, "valuefocus": 0, "license": license_status,
+            }
+        a["idates"].add(interaction_date)
+        a["mids"].add(mid)
+        a["behaviors"].add(bef)
+        if agent_name.strip():
+            a["has_agent"] = True
+        a["rows"] += 1
+        if usage_mode in _VALUEFOCUS_MODES:
+            a["valuefocus"] += 1
+        if license_status < a["license"]:
+            a["license"] = license_status
+
+        u = ua.get(uid)
+        if u is None:
+            u = ua[uid] = {"rows": 0, "weeks": set(), "license": license_status}
+        u["rows"] += 1
+        u["weeks"].add(week)
+        if license_status < u["license"]:
+            u["license"] = license_status
+
+    ads_rows: list[tuple[str, str, int, int, str]] = []
+    for (uid, month), a in um.items():
+        chat_active_days = len(a["idates"])
+        if chat_active_days <= 0:
+            continue
+        ads_rows.append((uid, month, chat_active_days, len(a["mids"]), a["license"]))
+    ads_rows.sort(key=lambda r: (r[0], r[1]))
+
+    umm_rows: list[tuple] = []
+    for (uid, month), a in um.items():
+        active_days = len(a["idates"])
+        behavior_count = len(a["behaviors"])
+        value_focus_share = (a["valuefocus"] / a["rows"]) if a["rows"] else 0.0
+        has_agent = a["has_agent"]
+        user_month_key = f"{uid}|{month[:7]}" if (uid and month) else ""
+        stage = _user_stage(active_days, behavior_count, value_focus_share, has_agent)
+        umm_rows.append((
+            uid, month, behavior_count, "True" if has_agent else "False",
+            active_days, user_month_key, stage, value_focus_share,
+        ))
+    umm_rows.sort(key=lambda r: (r[0], r[1]))
+
+    def _build_rankings(target_license: str) -> list[tuple]:
+        summary = []
+        for uid, u in ua.items():
+            if u["license"] != target_license:
+                continue
+            total_prompts = u["rows"]
+            total_weeks = len(u["weeks"])
+            avg_ppw = (total_prompts / total_weeks) if total_weeks else 0.0
+            summary.append((uid, total_prompts, total_weeks, avg_ppw))
+        avgs = sorted(s[3] for s in summary)
+        p90 = _percentile_inc(avgs, 0.90)
+        p75 = _percentile_inc(avgs, 0.75)
+        p50 = _percentile_inc(avgs, 0.50)
+        p25 = _percentile_inc(avgs, 0.25)
+        out = []
+        for uid, tp, tw, avg in summary:
+            out.append((uid, _usage_rank(avg, p90, p75, p50, p25), tp, tw, avg))
+        out.sort(key=lambda r: r[0])
+        return out
+
+    licensed_rank_rows = _build_rankings("M365 Copilot Licensed")
+    unlicensed_rank_rows = _build_rankings("Unlicensed")
+
+    lsum: dict[str, dict[str, int]] = {}
+    for uid, month, chat_active_days, prompt_count, lic in ads_rows:
+        if lic != "M365 Copilot Licensed":
+            continue
+        s = lsum.get(uid)
+        if s is None:
+            s = lsum[uid] = {"days": 0, "months": 0, "prompts": 0}
+        s["days"] += chat_active_days
+        s["months"] += 1
+        s["prompts"] += prompt_count
+    summary_rows: list[tuple] = []
+    for uid, s in lsum.items():
+        total_days = s["days"]
+        total_months = s["months"]
+        total_prompts = s["prompts"]
+        avg_days = (total_days / total_months) if total_months else 0.0
+        summary_rows.append((
+            uid, _activity_segment(avg_days), total_days, total_months,
+            total_prompts, avg_days,
+        ))
+    summary_rows.sort(key=lambda r: r[0])
+
+    def _write(path: str, header: list[str], rows: list[tuple], float_cols: set[int]) -> int:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f, lineterminator="\n")
+            w.writerow(header)
+            for r in rows:
+                w.writerow([_fmt_float(v) if i in float_cols else v for i, v in enumerate(r)])
+        return len(rows)
+
+    counts = {}
+    counts["active_days"] = _write(
+        agg_paths["active_days"],
+        ["Audit_UserId", "MonthStart", "ChatActiveDays", "PromptCount", "LicenseStatus"],
+        ads_rows, set(),
+    )
+    counts["user_month_metrics"] = _write(
+        agg_paths["user_month_metrics"],
+        ["Audit_UserId", "MonthStart", "BehaviorCount", "HasAgent", "ActiveDays",
+         "UserMonthKey", "UserStage", "ValueFocusShare"],
+        umm_rows, {7},
+    )
+    counts["licensed_rankings"] = _write(
+        agg_paths["licensed_rankings"],
+        ["Audit_UserId", "Usage Rank", "TotalPrompts", "TotalWeeks", "AvgPromptsPerWeek"],
+        licensed_rank_rows, {4},
+    )
+    counts["unlicensed_rankings"] = _write(
+        agg_paths["unlicensed_rankings"],
+        ["Audit_UserId", "Usage Rank", "TotalPrompts", "TotalWeeks", "AvgPromptsPerWeek"],
+        unlicensed_rank_rows, {4},
+    )
+    counts["licensed_summary"] = _write(
+        agg_paths["licensed_summary"],
+        ["Audit_UserId", "Activity Segment", "TotalActiveDays", "TotalMonths",
+         "TotalPrompts", "AvgActiveDaysPerMonth"],
+        summary_rows, {5},
+    )
+
+    if not quiet:
+        print("  Pre-aggregated tables (ValueLens):")
+        print(f"    ActiveDaysSummary:        {counts['active_days']:,} rows")
+        print(f"    UserMonthMetrics:         {counts['user_month_metrics']:,} rows")
+        print(f"    Licensed User Rankings:   {counts['licensed_rankings']:,} rows")
+        print(f"    Unlicensed User Rankings: {counts['unlicensed_rankings']:,} rows")
+        print(f"    Licensed User Summary:    {counts['licensed_summary']:,} rows")
+
+    return counts
 
 
 def run_processor(
@@ -1117,6 +2102,8 @@ def run_processor(
     entra_csv: str,
     fact_out_csv: str,
     users_out_csv: str,
+    profile: str = "aibv",
+    agg_paths: dict[str, str] | None = None,
     quiet: bool = False,
     seed_mid_map_path: str | None = None,
     seed_thread_map_path: str | None = None,
@@ -1131,8 +2118,11 @@ def run_processor(
         "unmatched_users": 0,
     }
 
+    profile_label = "ValueLens" if profile == "aibv" else "AI-in-One"
+
     if not quiet:
         print(f"Purview CopilotInteraction Processor v{SCRIPT_VERSION}")
+        print(f"  Profile:        {profile_label}")
         print(f"  JSON engine:    {_JSON_ENGINE}")
         print(f"  Purview input:  {purview_csv}")
         print(f"  Entra input:    {entra_csv}")
@@ -1179,7 +2169,7 @@ def run_processor(
         _load_int_seed(seed_mid_map_path, mid_to_int)
 
     user_lookup = load_entra_and_write_users(
-        entra_csv, users_out_csv, user_key_map, quiet=quiet
+        entra_csv, users_out_csv, user_key_map, quiet=quiet, profile=profile
     )
 
     if not quiet:
@@ -1224,7 +2214,7 @@ def run_processor(
                 continue
 
             try:
-                rows = explode_record(audit_data, user_lookup, user_key_map, thread_key_map)
+                rows = explode_record(audit_data, user_lookup, user_key_map, thread_key_map, profile)
             except Exception:
                 stats["errors"] += 1
                 continue
@@ -1250,16 +2240,18 @@ def run_processor(
         print()
         print("Writing rolled-up fact CSV...")
 
+    # Profile-specific output schema (AIO = 36-col; AIBV = 50-col superset).
+    grain_keys, nongrain_attrs_sel, fact_header = schema_for(profile)
     with open(fact_out_csv, "w", encoding="utf-8", newline="") as fout:
         writer = csv.writer(fout, lineterminator="\n")
-        writer.writerow(FACT_HEADER)
+        writer.writerow(fact_header)
         # Pre-compute the index of Message_Id within FACT_HEADER so we can
         # splice the INT surrogate into a list-of-attrs in one shot. The
         # list-based csv.writer.writerow path is materially faster than
         # DictWriter (skips dict-to-list translation + per-row genexpr).
-        nongrain_attrs = _NONGRAIN_ATTRS  # local rebind
+        nongrain_attrs = nongrain_attrs_sel  # local rebind
         for (grain_key, mid_int), attrs in rollup.items():
-            # FACT_HEADER = GRAIN_KEYS + ("Message_Id",) + _NONGRAIN_ATTRS
+            # fact_header = grain_keys + ("Message_Id",) + nongrain_attrs
             row_out = list(grain_key)
             row_out.append(mid_int)
             row_out.extend(attrs[k] for k in nongrain_attrs)
@@ -1270,6 +2262,14 @@ def run_processor(
     stats["distinct_thread_ids"] = len(thread_key_map)
     stats["distinct_user_keys"] = len(user_key_map)
     stats["unmatched_users"] = len(unmatched)
+
+    # Pre-aggregated tables (AIBV profile only, opt-in via --with-aggregates).
+    if profile != "aio" and agg_paths:
+        if not quiet:
+            print()
+            print("Writing pre-aggregated tables...")
+        compute_and_write_aggregates(rollup, agg_paths, quiet=quiet)
+
     elapsed = time.perf_counter() - start_time
     if not quiet:
         reduction_pct = (1 - len(rollup) / stats["output_rows"]) * 100 if stats["output_rows"] else 0
@@ -1294,7 +2294,7 @@ def main() -> None:
             f"Purview CopilotInteraction Processor v{SCRIPT_VERSION} - "
             "Two-input/two-output preprocessor that produces a rolled-up "
             "Interactions fact CSV (~85% row reduction via PromptCount grain) "
-            "and a Users dim CSV for the AI Business Value Dashboard PBIP."
+            "and a Users dim CSV for the ValueLens / AI-in-One Dashboard PBIPs."
         )
     )
     parser.add_argument(
@@ -1314,11 +2314,64 @@ def main() -> None:
         help="Directory for output files. Default: same directory as the Purview file.",
     )
     parser.add_argument(
+        "--profile",
+        "-p",
+        choices=("aibv", "aio"),
+        default="aibv",
+        help=(
+            "Output profile. 'aibv' (default) = ValueLens / AI Business Value "
+            "superset (50-col fact, 3-value Environment). 'aio' = AI-in-One "
+            "Dashboard (36-col fact, 5-value Environment) — reproduces the "
+            "original AIO output."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
         default=False,
         help="Suppress progress output.",
+    )
+    parser.add_argument(
+        "--with-aggregates",
+        action="store_true",
+        default=False,
+        help=(
+            "Also write the ValueLens pre-aggregated tables (ActiveDaysSummary, "
+            "UserMonthMetrics, Licensed/Unlicensed user rankings, Licensed user "
+            "summary). OFF by default. No effect for --profile aio."
+        ),
+    )
+    parser.add_argument(
+        "--deidentify",
+        action="store_true",
+        default=False,
+        help=(
+            "One-way hash all identifying values (UPNs, ThreadId/Message_Id GUIDs, "
+            "resource URLs) for anonymous reporting. Deterministic and "
+            "format-preserving, so UserKey/Users joins and distinct-resource "
+            "counts are preserved; irreversible (no decode map). NOTE (pax_fabric "
+            "port scope): Entra directory identity columns (PersonId, displayName, "
+            "manager fields, etc.) are NOT yet deidentified by this port — only "
+            "fact-row values produced from the audit JSON are covered."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchy-fill",
+        choices=("none", "self", "manager", "fixed"),
+        default="none",
+        help=(
+            "Filler for org-hierarchy level slots deeper than a user's own level "
+            "(Users dim). 'none' (default) leaves them blank; 'self' repeats the "
+            "user; 'manager' repeats the user's manager; 'fixed' uses "
+            "--hierarchy-fill-label. The hierarchy columns themselves are always "
+            "emitted regardless of this setting."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchy-fill-label",
+        default="",
+        help="Literal label used when '--hierarchy-fill fixed' is selected.",
     )
     parser.add_argument(
         "--seed-mid-map",
@@ -1355,6 +2408,25 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    global _DEIDENTIFY
+    _DEIDENTIFY = bool(args.deidentify)
+
+    global _HIER_FILL_MODE, _HIER_FILL_LABEL
+    _HIER_FILL_MODE = args.hierarchy_fill
+    _HIER_FILL_LABEL = args.hierarchy_fill_label or ""
+    if _HIER_FILL_MODE == "fixed" and not _HIER_FILL_LABEL:
+        print(
+            'ERROR: --hierarchy-fill fixed requires --hierarchy-fill-label "<text>".',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _HIER_FILL_MODE != "fixed" and _HIER_FILL_LABEL:
+        print(
+            "ERROR: --hierarchy-fill-label is only valid with --hierarchy-fill fixed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     purview_path = os.path.abspath(args.purview)
     entra_path = os.path.abspath(args.entra)
     for label, p in (("Purview", purview_path), ("Entra", entra_path)):
@@ -1367,17 +2439,30 @@ def main() -> None:
 
     purview_stem = Path(purview_path).stem
     entra_stem = Path(entra_path).stem
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Output stems intentionally inherit the timestamp already baked into the input
     # filenames (e.g. Purview_Audit_*_<ts>.csv, EntraUsers_MAClicensing_<ts>.csv) so the
     # rollup outputs share the same run timestamp without duplicating it.
     fact_out = str(out_dir / f"{purview_stem}_Interactions.csv")
     users_out = str(out_dir / f"{entra_stem}_Users.csv")
 
+    agg_paths: dict[str, str] | None = None
+    if args.profile != "aio" and args.with_aggregates:
+        agg_paths = {
+            "active_days": str(out_dir / f"{purview_stem}_ActiveDaysSummary_{run_ts}.csv"),
+            "user_month_metrics": str(out_dir / f"{purview_stem}_UserMonthMetrics_{run_ts}.csv"),
+            "licensed_rankings": str(out_dir / f"{purview_stem}_LicensedUserRankings_{run_ts}.csv"),
+            "unlicensed_rankings": str(out_dir / f"{purview_stem}_UnlicensedUserRankings_{run_ts}.csv"),
+            "licensed_summary": str(out_dir / f"{purview_stem}_LicensedUserSummary_{run_ts}.csv"),
+        }
+
     stats = run_processor(
         purview_csv=purview_path,
         entra_csv=entra_path,
         fact_out_csv=fact_out,
         users_out_csv=users_out,
+        profile=args.profile,
+        agg_paths=agg_paths,
         quiet=args.quiet,
         seed_mid_map_path=args.seed_mid_map,
         seed_thread_map_path=args.seed_thread_map,

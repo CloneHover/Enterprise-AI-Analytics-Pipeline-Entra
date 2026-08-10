@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -682,6 +683,9 @@ def initialize_checkpoint_for_new_run(
             "blockHours": all_parameters.get("BlockHours") or 0.5,
             "completed": [],
             "queryCreated": [],
+            # v1.11.15 parity: durable uncertain-create tracking (see
+            # mark_partition_uncertain / resolve_uncertain_creates below).
+            "uncertainCreate": [],
         },
         "statistics": {
             "totalRecordsSaved": 0,
@@ -903,6 +907,232 @@ def save_checkpoint(
 
     # Save to disk
     save_checkpoint_to_disk()
+
+
+# ---------------------------------------------------------------------------
+# HARDENED CREATE / UNCERTAIN-CREATE RECONCILIATION (v1.11.15 parity)
+# ---------------------------------------------------------------------------
+# PS equivalents (consolidated here for the Python port): New-GraphAuditQueryFingerprint,
+# Invoke-GraphAuditHardenedCreate, Resolve-GraphAuditDuplicateSafeQuery,
+# Test-PaxCheckpointEntryCompatible, Resolve-PaxOperatorClearedUncertain.
+#
+# Contract: a partition's Graph audit query CREATE call is "uncertain" when the
+# POST was sent but the response could not be confirmed (network error/timeout
+# immediately after send) — the server may or may not have actually created the
+# query. Rather than blindly re-POSTing on -Resume (risking a duplicate server-side
+# query), the partition is recorded as durably "uncertain" and is SKIPPED on
+# resume until the operator explicitly clears it via -ClearUncertainCreate
+# (by partition index) or -ClearUncertainContract (by "<index>:<fingerprint>"
+# token, for the rare case of >1 uncertain contract sharing one index).
+
+
+def compute_partition_fingerprint(
+    activity_type: str,
+    partition_start: datetime,
+    partition_end: datetime,
+    extra: str = "",
+) -> str:
+    """Deterministic fingerprint identifying a logical Graph audit query
+    create request. Same inputs always produce the same fingerprint, so a
+    resume can recognize "this is the same query I already tried to create"
+    even across process restarts."""
+    canon = "|".join(
+        [
+            str(activity_type),
+            partition_start.astimezone(timezone.utc).isoformat() if partition_start.tzinfo else partition_start.isoformat(),
+            partition_end.astimezone(timezone.utc).isoformat() if partition_end.tzinfo else partition_end.isoformat(),
+            extra,
+        ]
+    )
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+
+
+def mark_partition_uncertain(
+    partition_index: int,
+    activity_type: str,
+    partition_start: datetime,
+    partition_end: datetime,
+    extra: str = "",
+) -> str:
+    """Record (or refresh) a durable uncertain-create entry for
+    ``partition_index``. Returns the computed fingerprint. Multiple calls for
+    the same (index, fingerprint) update ``lastAttemptUtc`` in place rather
+    than duplicating the entry; a different fingerprint at the same index is
+    appended as a SEPARATE contract (disambiguated later via
+    -ClearUncertainContract)."""
+    if not _checkpoint_data:
+        return ""
+    fp = compute_partition_fingerprint(activity_type, partition_start, partition_end, extra)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    uncertain_list = _checkpoint_data.setdefault("partitions", {}).setdefault("uncertainCreate", [])
+    for entry in uncertain_list:
+        if entry.get("index") == partition_index and entry.get("fingerprint") == fp:
+            entry["lastAttemptUtc"] = now_iso
+            save_checkpoint_to_disk()
+            return fp
+    uncertain_list.append(
+        {
+            "index": partition_index,
+            "fingerprint": fp,
+            "activityType": activity_type,
+            "firstObservedUtc": now_iso,
+            "lastAttemptUtc": now_iso,
+        }
+    )
+    save_checkpoint_to_disk()
+    return fp
+
+
+def clear_partition_uncertain(partition_index: int, fingerprint: Optional[str] = None) -> int:
+    """Remove uncertain-create entries for ``partition_index`` (all
+    fingerprints, or only ``fingerprint`` when given). Returns count removed.
+    Called on a CONFIRMED successful create so the uncertain marker is
+    superseded by a normal ``QueryCreated`` entry."""
+    if not _checkpoint_data:
+        return 0
+    uncertain_list = _checkpoint_data.get("partitions", {}).get("uncertainCreate", [])
+    before = len(uncertain_list)
+    if fingerprint is None:
+        kept = [e for e in uncertain_list if e.get("index") != partition_index]
+    else:
+        kept = [
+            e for e in uncertain_list
+            if not (e.get("index") == partition_index and e.get("fingerprint") == fingerprint)
+        ]
+    _checkpoint_data["partitions"]["uncertainCreate"] = kept
+    removed = before - len(kept)
+    if removed:
+        save_checkpoint_to_disk()
+    return removed
+
+
+def get_uncertain_partitions() -> list[dict[str, Any]]:
+    """Return the durable uncertain-create entries (read-only snapshot)."""
+    if not _checkpoint_data:
+        return []
+    return list(_checkpoint_data.get("partitions", {}).get("uncertainCreate", []))
+
+
+def resolve_operator_cleared_uncertain(
+    clear_uncertain_create: Optional[list[int]] = None,
+    clear_uncertain_contract: Optional[list[str]] = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Apply operator-supplied ``-ClearUncertainCreate`` / ``-ClearUncertainContract``
+    selections to the durable uncertain-create list on resume.
+
+    - ``clear_uncertain_create``: bare partition indices. An index mapping to
+      exactly one uncertain contract is cleared; an index mapping to MORE
+      THAN ONE distinct fingerprint is left untouched and a warning listing
+      the candidate ``"<index>:<fingerprint>"`` tokens is returned instead
+      (ambiguous — the operator must use -ClearUncertainContract).
+    - ``clear_uncertain_contract``: explicit ``"<index>:<fingerprint>"``
+      tokens; each clears exactly that one contract.
+
+    Returns ``(cleared_entries, warnings)``. Never raises.
+    """
+    cleared: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    if not _checkpoint_data:
+        return cleared, warnings
+
+    uncertain_list = list(_checkpoint_data.get("partitions", {}).get("uncertainCreate", []))
+
+    for idx in (clear_uncertain_create or []):
+        candidates = [e for e in uncertain_list if e.get("index") == idx]
+        if len(candidates) == 0:
+            continue
+        if len(candidates) > 1:
+            tokens = ", ".join(f"{idx}:{e.get('fingerprint')}" for e in candidates)
+            warnings.append(
+                f"Partition {idx} has {len(candidates)} distinct uncertain-create contracts "
+                f"({tokens}); ambiguous -ClearUncertainCreate {idx} left untouched. "
+                f"Use -ClearUncertainContract with one of the tokens above instead."
+            )
+            continue
+        entry = candidates[0]
+        if clear_partition_uncertain(idx, entry.get("fingerprint")):
+            cleared.append(entry)
+
+    for token in (clear_uncertain_contract or []):
+        if ":" not in token:
+            warnings.append(f"Malformed -ClearUncertainContract token (expected '<index>:<fingerprint>'): {token!r}")
+            continue
+        idx_str, fp = token.split(":", 1)
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            warnings.append(f"Malformed -ClearUncertainContract token (non-integer index): {token!r}")
+            continue
+        matches = [e for e in uncertain_list if e.get("index") == idx and e.get("fingerprint") == fp]
+        if not matches:
+            warnings.append(f"-ClearUncertainContract token not found in checkpoint: {token!r}")
+            continue
+        if clear_partition_uncertain(idx, fp):
+            cleared.append(matches[0])
+
+    return cleared, warnings
+
+
+def invoke_hardened_partition_create(
+    partition_index: int,
+    activity_type: str,
+    partition_start: datetime,
+    partition_end: datetime,
+    create_fn: Callable[[], str],
+    *,
+    extra: str = "",
+) -> str:
+    """Duplicate-safe wrapper around a partition's Graph audit query CREATE
+    call. Mirrors PS ``Invoke-GraphAuditHardenedCreate`` /
+    ``Resolve-GraphAuditDuplicateSafeQuery``:
+
+    1. If the partition is already ``Completed`` or has a live ``queryCreated``
+       entry, returns the existing ``queryId`` without calling ``create_fn``
+       (duplicate-safe — never re-creates a query that already exists).
+    2. If the partition has an UNCLEARED durable uncertain-create entry, raises
+       ``RuntimeError`` — the caller must resolve it via -ClearUncertainCreate
+       / -ClearUncertainContract before a fresh create is attempted.
+    3. Otherwise calls ``create_fn()``. On success, clears any stale uncertain
+       entry for this fingerprint and records ``QueryCreated`` via
+       :func:`save_checkpoint`. On an exception raised by ``create_fn`` (e.g. a
+       network timeout with an ambiguous outcome), marks the partition
+       uncertain via :func:`mark_partition_uncertain` and re-raises so the
+       caller's existing retry/backoff logic still applies.
+    """
+    fp = compute_partition_fingerprint(activity_type, partition_start, partition_end, extra)
+
+    if _checkpoint_data:
+        for e in _checkpoint_data.get("partitions", {}).get("completed", []):
+            if e.get("index") == partition_index and e.get("queryId"):
+                return e["queryId"]
+        for e in _checkpoint_data.get("partitions", {}).get("queryCreated", []):
+            if e.get("index") == partition_index and e.get("queryId"):
+                return e["queryId"]
+
+        for e in _checkpoint_data.get("partitions", {}).get("uncertainCreate", []):
+            if e.get("index") == partition_index and e.get("fingerprint") == fp:
+                raise RuntimeError(
+                    f"Partition {partition_index} has an unresolved uncertain-create "
+                    f"contract (fingerprint={fp}). Re-run with -ClearUncertainCreate "
+                    f"{partition_index} or -ClearUncertainContract {partition_index}:{fp} "
+                    f"to force a fresh query creation."
+                )
+
+    try:
+        query_id = create_fn()
+    except Exception:
+        mark_partition_uncertain(partition_index, activity_type, partition_start, partition_end, extra)
+        raise
+
+    clear_partition_uncertain(partition_index, fp)
+    save_checkpoint(
+        partition_index=partition_index,
+        state="QueryCreated",
+        query_id=query_id,
+        partition_start=partition_start,
+        partition_end=partition_end,
+    )
+    return query_id
 
 
 # ---------------------------------------------------------------------------

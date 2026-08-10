@@ -39,6 +39,7 @@ from typing import Any
 from .models import PAXConfig, PAXRunContext
 from .mod1_pax_config import (
     SCRIPT_VERSION,
+    check_for_updates,
     initialize_config,
     resolve_activity_types,
     resolve_data_type_paths,
@@ -49,6 +50,7 @@ from .mod3_pax_logging import (
     set_progress_phase,
     write_log,
     write_log_host,
+    write_pax_memory_observation,
 )
 from .mod5_pax_auth import (
     connect_purview_audit,
@@ -71,6 +73,11 @@ from .mod6_pax_checkpoint import (
     set_checkpoint_enabled,
     sync_fabric_resume_mirror,
     remove_fabric_resume_mirror,
+    clear_partition_uncertain,
+    compute_partition_fingerprint,
+    get_uncertain_partitions,
+    mark_partition_uncertain,
+    resolve_operator_cleared_uncertain,
 )
 from .mod7_pax_graph_api import (
     GraphAuthExpiredError,
@@ -83,7 +90,12 @@ from .mod7_pax_graph_api import (
     convert_from_graph_audit_record,
     get_current_headers,
 )
-from .mod8_pax_entra import get_entra_users_data
+from .mod8_pax_entra import (
+    get_entra_users_data,
+    load_user_info_file,
+    load_user_info_supplement,
+    merge_entra_supplement,
+)
 from .mod9_pax_data_transform import (
     convert_to_purview_exploded_records,
     convert_to_structured_record,
@@ -104,6 +116,7 @@ from .mod13_pax_dual_mode import (
     _is_transient,
     disconnect_purview_audit,
     expand_group_to_users,
+    resolve_pax_user_scope,
 )
 from .mod14_pax_remote_output import (
     invoke_output_upload,
@@ -116,6 +129,8 @@ from .mod14_pax_remote_output import (
 EXIT_SUCCESS = 0
 EXIT_LIMIT_HIT = 10
 EXIT_CIRCUIT_BREAKER = 20
+EXIT_DIRECTORY_FETCH = 30
+EXIT_COMPLETED_WITH_GAPS = 40
 EXIT_ERROR = 1
 
 
@@ -666,6 +681,8 @@ def main() -> int:
         _pkg_logger.propagate = True
 
         write_log(f"PAX Purview Audit Log Processor v{SCRIPT_VERSION}")
+        if not getattr(config, "skip_version_check", False):
+            check_for_updates(SCRIPT_VERSION, log=write_log_host)
         write_log(f"Start: {config.start_date}  End: {config.end_date}")
 
         # ==================================================================
@@ -742,6 +759,31 @@ def main() -> int:
                 read_checkpoint(checkpoint_path=cp_path)
                 ctx.checkpoint_path = cp_path
                 write_log(f"Resumed from checkpoint: {cp_path}")
+
+                # v1.11.15 parity: apply operator -ClearUncertainCreate /
+                # -ClearUncertainContract selections against the restored
+                # checkpoint's durable uncertain-create list BEFORE query
+                # orchestration resumes, so cleared partitions are eligible
+                # for a fresh create this run.
+                cleared, uncertain_warnings = resolve_operator_cleared_uncertain(
+                    clear_uncertain_create=getattr(config, 'clear_uncertain_create', None),
+                    clear_uncertain_contract=getattr(config, 'clear_uncertain_contract', None),
+                )
+                for entry in cleared:
+                    write_log(
+                        f"Cleared uncertain-create contract for partition {entry.get('index')} "
+                        f"(fingerprint={entry.get('fingerprint')}) — will be recreated fresh."
+                    )
+                for warning in uncertain_warnings:
+                    write_log(warning, level="WARN")
+                remaining_uncertain = get_uncertain_partitions()
+                if remaining_uncertain:
+                    write_log(
+                        f"{len(remaining_uncertain)} partition(s) still have an unresolved "
+                        f"uncertain-create contract and will be skipped until cleared via "
+                        f"-ClearUncertainCreate / -ClearUncertainContract.",
+                        level="WARN",
+                    )
 
         # ==================================================================
         # PHASE 5: Query Orchestration
@@ -1085,6 +1127,16 @@ def main() -> int:
         write_log(traceback.format_exc(), level="ERROR")
         exit_code = EXIT_ERROR
 
+    # Non-fatal outcome refinement (PS exit-code precedence: 30 (directory
+    # fetch) > 40 (completed with gaps) > 0 (success)). Only applied when the
+    # run otherwise succeeded — a fatal error/SystemExit/Ctrl+C code above is
+    # never downgraded or upgraded here.
+    if exit_code == EXIT_SUCCESS:
+        if getattr(ctx.metrics, 'entra_directory_fetch_failed', False):
+            exit_code = EXIT_DIRECTORY_FETCH
+        elif getattr(ctx.metrics, 'partitions_with_data_loss', 0) > 0:
+            exit_code = EXIT_COMPLETED_WITH_GAPS
+
     return exit_code
 
 
@@ -1110,16 +1162,13 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         return elapsed
 
     # Expand group memberships to target users
+    # PS parity: Resolve-PaxUserScope combines UserIds + GroupNames into one
+    # deduplicated scope. Resolution requires an authenticated Graph session,
+    # so the actual call happens after `session`/`token` are constructed below.
     target_users = None
-    if getattr(config, 'group_names', None):
-        all_group_users: list[str] = []
-        for group_name in config.group_names:
-            users = expand_group_to_users(
-                group_identity=group_name,
-                log_fn=lambda msg, lvl='INFO': write_log(msg, level=lvl),
-            )
-            all_group_users.extend(users)
-        target_users = list(dict.fromkeys(all_group_users)) or None  # dedupe
+    # PS L31428-L31432 parity: Graph API doesn't support UPN filtering server-side,
+    # so a lowercase set is precomputed once for O(1) client-side filtering below.
+    target_users_set_lower: set[str] | None = None
 
     # Resolve activity types
     activity_types = resolve_activity_types(config)
@@ -1213,6 +1262,75 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
     # Auto-detect Graph API version (PS: Get-GraphAuditApiUri auto-detection L7884)
     api_version = detect_graph_audit_api_version(session)
     ctx.graph_api_version = api_version
+
+    # --- Resolve target user scope (PS parity: Resolve-PaxUserScope) ---
+    # Combines UserIds + GroupNames into a deduplicated union of UPNs and
+    # fails closed if any group is missing, ambiguous, empty, or errors —
+    # this prevents silent degradation to a full-tenant query.
+    _requested_user_ids = list(getattr(config, 'user_ids', None) or [])
+    _requested_group_names = list(getattr(config, 'group_names', None) or [])
+    if _requested_user_ids or _requested_group_names:
+        def _scope_graph_get(_method: str, _url: str) -> dict:
+            # Thin wrapper so mod13 can call Graph without knowing about
+            # requests/sessions. Raises on HTTP errors so failure
+            # classification can inspect the status code.
+            resp = session.get(_url, timeout=60)
+            resp.raise_for_status()
+            try:
+                return resp.json() or {}
+            except ValueError:
+                return {}
+
+        _scope = resolve_pax_user_scope(
+            user_ids=_requested_user_ids,
+            group_names=_requested_group_names,
+            graph_request_fn=_scope_graph_get,
+            log_fn=lambda msg, lvl='info': write_log(msg, level=str(lvl).upper()),
+        )
+
+        if _scope.outcome != 'Succeeded':
+            # PS parity: fail closed rather than run an unfiltered query.
+            _details = []
+            if _scope.failed_groups:
+                _details.append(f"not found: {_scope.failed_groups}")
+            if _scope.ambiguous_groups:
+                _details.append(f"ambiguous: {_scope.ambiguous_groups}")
+            if _scope.zero_member_groups:
+                _details.append(f"no user members: {_scope.zero_member_groups}")
+            if _scope.unauthorized_groups:
+                _details.append(f"unauthorized: {_scope.unauthorized_groups}")
+            if _scope.transport_error_groups:
+                _details.append(f"transport error: {_scope.transport_error_groups}")
+            if _scope.resolution_error_groups:
+                _details.append(f"resolution error: {_scope.resolution_error_groups}")
+            _detail_msg = "; ".join(_details) if _details else "no group details"
+            raise RuntimeError(
+                f"User scope resolution failed ({_scope.failure_stage}): "
+                f"{_detail_msg}. Aborting to avoid an unfiltered full-tenant "
+                "query. Verify group identifiers, membership, and that the "
+                "app has GroupMember.Read.All."
+            )
+
+        target_users = list(_scope.final_target_users) or None
+        # Belt-and-braces: if scoping was explicitly requested we must have at
+        # least one target user; empty here would mean silent full-tenant.
+        if target_users is None:
+            raise RuntimeError(
+                "User scope resolution produced zero target users despite "
+                "UserIds/GroupNames being set. Aborting to avoid an "
+                "unfiltered full-tenant query."
+            )
+        # PS L31428-L31432 parity: case-insensitive UPN set consumed by
+        # _query_fn (non-flush path) and _page_spill (memory-flush path).
+        target_users_set_lower = {
+            u.strip().lower() for u in target_users if u and u.strip()
+        }
+        write_log(
+            "Target user scope resolved: "
+            f"{len(_scope.matched_explicit_user_ids) + len(_scope.unmatched_explicit_user_ids)} "
+            f"explicit user(s), {len(_scope.resolved_groups)} group(s), "
+            f"{len(target_users)} unique UPN(s) after dedup"
+        )
 
     # --- Build query_fn factory for invoke_activity_time_window_processing ---
     # Each partition thread needs its own HTTP session (thread-safe isolation).
@@ -1512,6 +1630,32 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
 
         display_name = f"PAX_{operations_list[0] if operations_list else 'Query'}_{block_start.strftime('%Y%m%d%H%M')}"
 
+        # v1.11.15 parity: hardened / duplicate-safe create — refuse to blindly
+        # resubmit a partition that has an unresolved uncertain-create contract
+        # from a prior interrupted run. The operator must clear it via
+        # -ClearUncertainCreate / -ClearUncertainContract before a fresh query
+        # is attempted (avoids risking a duplicate server-side query).
+        _submit_fp = compute_partition_fingerprint(activity_type, block_start, block_end)
+        for _uncertain_entry in get_uncertain_partitions():
+            if _uncertain_entry.get("index") == p_idx and _uncertain_entry.get("fingerprint") == _submit_fp:
+                _record_data_loss(
+                    phase="submit",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    cause="protocol",
+                    reason=(
+                        f"unresolved uncertain-create contract (fingerprint={_submit_fp}); "
+                        f"resolve via -ClearUncertainCreate {p_idx} or "
+                        f"-ClearUncertainContract {p_idx}:{_submit_fp}"
+                    ),
+                )
+                raise PartitionRetryableError(
+                    f"uncertain-create unresolved p={p_idx} q#{q_num} fp={_submit_fp}"
+                )
+
         # Submit query — retry once on 401, and up to 3 times on transient 403.
         submit_401_retried = False
         submit_403_retries = 0
@@ -1525,6 +1669,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                     operations=operations_list,
                     record_types=config.record_types,
                     service_types=config.service_types,
+                    user_principal_names=list(user_ids) if user_ids else None,
                     http_client=http,
                     api_version=api_version,
                     partition_index=p_idx,
@@ -1579,6 +1724,28 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                 raise PartitionRetryableError(
                     f"submit 403-failed p={p_idx} q#{q_num}"
                 )
+            except Exception as _submit_exc:
+                # Ambiguous failure (network error, timeout, unexpected server
+                # response, etc.) — we cannot tell whether the server actually
+                # created the query. Mark it durably uncertain rather than
+                # silently losing track of it (v1.11.15 hardened-create parity).
+                mark_partition_uncertain(p_idx, activity_type, block_start, block_end)
+                _record_data_loss(
+                    phase="submit",
+                    partition_index=p_idx,
+                    query_number=q_num,
+                    block_start=block_start,
+                    block_end=block_end,
+                    activity_type=activity_type,
+                    cause="network",
+                    reason=(
+                        f"ambiguous submit failure ({type(_submit_exc).__name__}: {_submit_exc}) "
+                        f"— marked uncertain-create (fingerprint={_submit_fp})"
+                    ),
+                )
+                raise PartitionRetryableError(
+                    f"submit ambiguous-failed p={p_idx} q#{q_num}: {_submit_exc}"
+                )
 
         if not query_id:
             write_log(
@@ -1603,6 +1770,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
         # CHECKPOINT: Save QueryCreated state so resume can skip query creation
         # and go straight to fetch if the server-side query is still alive.
         # (PS L24178-24182: Save-Checkpoint -State 'QueryCreated')
+        clear_partition_uncertain(p_idx, _submit_fp)
         save_checkpoint(
             partition_index=p_idx,
             state='QueryCreated',
@@ -1816,6 +1984,7 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
             if elapsed_min != last_log_minute and elapsed_min % 5 == 0:
                 last_log_minute = elapsed_min
                 write_log(f"  [p={p_idx}/{p_tot} q#{q_num} id={query_id[:8]}] ... {elapsed_min} min elapsed, status={status}")
+                write_pax_memory_observation(stage=f"poll:p{p_idx}", rows_processed=partition_so_far)
 
             # Gentle backoff: 15s -> 30s -> 60s (PS L11555-11556)
             if elapsed_min >= 10 and poll_interval < 60:
@@ -1944,6 +2113,21 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
 
         # Normalize Graph records to EOM-compatible schema
         normalized = convert_from_graph_audit_record(raw_records)
+
+        # PS L31428-L31432 parity: Graph API has no server-side UPN filter,
+        # so apply the resolved user scope client-side before returning.
+        if target_users_set_lower and normalized:
+            _before_filter = len(normalized)
+            normalized = [
+                r for r in normalized
+                if ((r.get('UserIds') or r.get('UserId') or '')
+                    .strip().lower() in target_users_set_lower)
+            ]
+            write_log(
+                f"{log_prefix} [Graph API] Applied UserIds scope filter: "
+                f"{_before_filter} \u2192 {len(normalized)} records",
+                level="INFO",
+            )
         return normalized
 
     # --- Create orchestrator state ---
@@ -2218,6 +2402,24 @@ def _run_query_phase(ctx: PAXRunContext) -> int:
                         normalized = convert_from_graph_audit_record(raw_page)
                         if not normalized:
                             return
+                        # PS L31428-L31432 parity: filter client-side before
+                        # persistence so streamed shards match the resolved scope.
+                        if target_users_set_lower:
+                            _before_filter = len(normalized)
+                            normalized = [
+                                r for r in normalized
+                                if ((r.get('UserIds') or r.get('UserId') or '')
+                                    .strip().lower() in target_users_set_lower)
+                            ]
+                            if _before_filter != len(normalized):
+                                write_log(
+                                    f"  [Graph API] Partition {_p} page-flush "
+                                    f"UserIds scope filter: {_before_filter} "
+                                    f"\u2192 {len(normalized)} records",
+                                    level="INFO",
+                                )
+                            if not normalized:
+                                return
                         # PS parity: append (do NOT truncate) on first page
                         # of a retry. Phase 6 drainage dedups by RecordId/Id
                         # via seen_ids, so overlap from a prior failed pass
@@ -2681,11 +2883,38 @@ def _run_rollup_processors(
             purview_stem = Path(ctx.output_file).stem
             entra_stem = Path(entra_csv).stem if entra_csv else 'EntraUsers'
 
+            # v1.11.15 parity: -Dashboard selects the copilot processor's output
+            # profile ('ValueLens' -> aibv superset; 'AIO' / unset -> aio).
+            # -Deidentify sets the processor's module-level flag before the run.
+            dashboard = str(getattr(config, 'dashboard', 'AIO') or 'AIO').upper()
+            copilot_profile = 'aibv' if dashboard == 'VALUELENS' else 'aio'
+            if getattr(config, 'deidentify', False):
+                import pax_fabric.processors.copilot_processor as _copilot_mod
+                _copilot_mod._DEIDENTIFY = True
+
+            # v1.11.15 parity: -FillerLabel controls what appears in org-hierarchy
+            # level slots deeper than a user's own level in the rolled-up Users
+            # output (None default; 'Blank'->none, 'Self'->self, 'RepeatManager'->
+            # manager, 'Fixed'+-FillerLabelText->literal label).
+            _filler_mode_map = {
+                None: 'none', '': 'none', 'blank': 'none',
+                'self': 'self', 'repeatmanager': 'manager', 'fixed': 'fixed',
+            }
+            _filler_raw = getattr(config, 'filler_label', None)
+            _hier_fill_mode = _filler_mode_map.get(
+                str(_filler_raw).lower() if _filler_raw else None, 'none'
+            )
+            _hier_fill_label = getattr(config, 'filler_label_text', None) or ''
+            import pax_fabric.processors.copilot_processor as _copilot_mod2
+            _copilot_mod2._HIER_FILL_MODE = _hier_fill_mode
+            _copilot_mod2._HIER_FILL_LABEL = _hier_fill_label
+
             copilot_run(
                 purview_csv=ctx.output_file,
                 entra_csv=entra_csv,
                 fact_out_csv=str(out_dir / f"{purview_stem}_Interactions.csv"),
                 users_out_csv=str(out_dir / f"{entra_stem}_Users.csv"),
+                profile=copilot_profile,
                 quiet=True,
                 seed_mid_map_path=seed_mid_map_path,
                 seed_thread_map_path=seed_thread_map_path,
@@ -2921,6 +3150,45 @@ def _run_delta_export(ctx: PAXRunContext) -> None:
         ctx.metrics.partitions_with_data_loss += 1
 
 
+def _fetch_entra_users_with_overrides(
+    config: PAXConfig,
+    entra_session: Any,
+    token_refresh_fn: Any,
+) -> list[dict]:
+    """Resolve the Entra user directory honoring ``-UserInfoFile`` /
+    ``-UserInfoSupplement`` overrides (v1.11.15 parity).
+
+    Precedence (mutually exclusive by validate_config):
+        1. user_info_file  — REPLACES the live directory pull entirely.
+        2. user_info_supplement — live pull, then left-join supplemental
+           columns by UserPrincipalName; unmatched supplemental rows are
+           logged as a warning (never raised — mirrors PS's non-fatal report).
+        3. neither — plain live fetch (unchanged behavior).
+    """
+    user_info_file = getattr(config, "user_info_file", None)
+    if user_info_file:
+        write_log(f"UserInfoFile supplied — using {user_info_file} instead of a live Entra pull.")
+        return load_user_info_file(user_info_file)
+
+    entra_data = get_entra_users_data(
+        http_client=entra_session,
+        token_refresh_fn=token_refresh_fn,
+    )
+
+    supplement_path = getattr(config, "user_info_supplement", None)
+    if supplement_path and entra_data:
+        write_log(f"UserInfoSupplement supplied — enriching live directory from {supplement_path}.")
+        supplement_rows, upn_col = load_user_info_supplement(supplement_path)
+        entra_data, unmatched = merge_entra_supplement(entra_data, supplement_rows, upn_col)
+        if unmatched:
+            write_log(
+                f"UserInfoSupplement: {len(unmatched)} supplemental row(s) had no matching "
+                f"Entra user and were excluded.",
+                level="WARN",
+            )
+    return entra_data
+
+
 def _export_entra_users_only(ctx: PAXRunContext) -> None:
     """Export Entra user/license data as the sole output (-OnlyUserInfo mode).
 
@@ -2973,11 +3241,18 @@ def _export_entra_users_only(ctx: PAXRunContext) -> None:
         return False
 
     write_log("Fetching Entra user directory and license data...")
-    entra_data = get_entra_users_data(
-        http_client=entra_session,
-        token_refresh_fn=_entra_token_refresh,
-    )
+    try:
+        entra_data = _fetch_entra_users_with_overrides(
+            config, entra_session, _entra_token_refresh
+        )
+    except Exception as ex:
+        write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
+        ctx.metrics.entra_directory_fetch_failed = True
+        entra_data = []
     if entra_data:
+        if getattr(config, 'deidentify', False):
+            from .mod18_pax_deidentify import PaxDeidentifier
+            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)
@@ -3033,11 +3308,18 @@ def _export_entra_users(ctx: PAXRunContext) -> None:
         )
         return False
 
-    entra_data = get_entra_users_data(
-        http_client=entra_session,
-        token_refresh_fn=_entra_token_refresh,
-    )
+    entra_data = []
+    try:
+        entra_data = _fetch_entra_users_with_overrides(
+            config, entra_session, _entra_token_refresh
+        )
+    except Exception as ex:
+        write_log(f"Entra directory fetch failed: {ex}", level="ERROR")
+        ctx.metrics.entra_directory_fetch_failed = True
     if entra_data:
+        if getattr(config, 'deidentify', False):
+            from .mod18_pax_deidentify import PaxDeidentifier
+            entra_data = PaxDeidentifier().deidentify_rows("EntraUsers", entra_data)
         entra_columns = list(entra_data[0].keys()) if entra_data else []
         writer = CsvWriter(path=entra_csv, columns=entra_columns)
         writer.write_rows(entra_data)

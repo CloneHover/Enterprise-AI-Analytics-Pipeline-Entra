@@ -143,4 +143,3 @@ class PaxDeidentifier:
 
 
 default_deidentifier = PaxDeidentifier()
-"""Deterministic, one-way de-identification for PAX v1.11.15 CSV output."""

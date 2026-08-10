@@ -284,6 +284,7 @@ def invoke_graph_audit_query(
     operations: Optional[list[str]] = None,
     record_types: Optional[list[str]] = None,
     service_types: Optional[list[str]] = None,
+    user_principal_names: Optional[list[str]] = None,
     *,
     http_client: Any = None,
     api_version: str = "v1.0",
@@ -309,6 +310,10 @@ def invoke_graph_audit_query(
                     PS alias: OperationFilters.
         record_types: Optional record type filters. PS alias: RecordTypeFilters.
         service_types: Optional service/workload filters. PS alias: ServiceFilter.
+        user_principal_names: Optional UPN scope. Merged list of explicit
+            -UserIds and expanded -GroupNames members. When non-empty, sent
+            as ``userPrincipalNameFilters`` in the Graph API body so the
+            server pre-filters records before pagination.
         http_client: HTTP client with .post() method (e.g., httpx.Client).
         api_version: Graph API version string.
         get_uri_fn: Optional function to build the URI (defaults to get_audit_uri).
@@ -366,6 +371,28 @@ def invoke_graph_audit_query(
         if effective_service_types and len(effective_service_types) > 0:
             body["serviceFilter"] = effective_service_types[0]
 
+        # UPN scope (server-side pre-filter). Dedupe case-insensitively while
+        # preserving first-seen casing so the request body is deterministic.
+        effective_upns: Optional[List[str]] = None
+        if user_principal_names:
+            _seen_upn: set = set()
+            effective_upns = []
+            for _u in user_principal_names:
+                if _u is None:
+                    continue
+                _t = str(_u).strip()
+                if not _t:
+                    continue
+                _k = _t.lower()
+                if _k in _seen_upn:
+                    continue
+                _seen_upn.add(_k)
+                effective_upns.append(_t)
+            if effective_upns:
+                body["userPrincipalNameFilters"] = effective_upns
+            else:
+                effective_upns = None
+
         # Log query details for troubleshooting.
         # Emit as ONE atomic log record so parallel partitions don't interleave
         # and both per-partition body blocks survive in the log file.
@@ -378,6 +405,10 @@ def invoke_graph_audit_query(
             _body_log_lines.append(f"  recordTypeFilters: {', '.join(effective_record_types)}")
         if effective_service_types and len(effective_service_types) > 0:
             _body_log_lines.append(f"  serviceFilter: {effective_service_types[0]}")
+        if effective_upns:
+            _body_log_lines.append(
+                f"  userPrincipalNameFilters: {len(effective_upns)} UPN(s)"
+            )
         _body_log_lines.append(body_json)
         logger.info("\n".join(_body_log_lines))
 

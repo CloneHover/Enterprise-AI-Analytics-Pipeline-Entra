@@ -432,6 +432,41 @@ def expand_group_to_users(
         Graph API error). This preserves PS fail-closed semantics so a
         misconfigured group can never silently degrade the run to an
         unfiltered full-tenant query.
+    """
+    _log = log_fn or (lambda msg, lvl: logger.log(
+        {'info': logging.INFO, 'warn': logging.WARNING, 'error': logging.ERROR}.get(lvl, logging.INFO), msg))
+
+    members: List[str] = []
+
+    if not group_identity or not group_identity.strip():
+        return members
+
+    if graph_request_fn is None:
+        _log("No graph_request_fn provided for group expansion", 'error')
+        return members
+
+    try:
+        _log(f"Processing group (Graph API): '{group_identity}'", 'info')
+
+        # --- Resolve group ID ---
+        group_id: Optional[str] = None
+
+        if _GUID_RE.match(group_identity):
+            # Already a GUID
+            group_id = group_identity
+        else:
+            # Try display name first
+            _log("Resolving group ID from display name...", 'info')
+            escaped = group_identity.replace("'", "''")
+            filter_url = f"https://graph.microsoft.com/v1.0/groups?$filter=displayName eq '{escaped}'"
+
+            try:
+                resp = graph_request_fn('GET', filter_url)
+                values = resp.get('value', []) if resp else []
+                if values:
+                    group_id = values[0].get('id')
+            except Exception:
+                pass
 
             # Fallback: try by mail
             if not group_id:
